@@ -1,0 +1,6 @@
+{
+  "name": "Prob8",
+  "description": "Prob8 — Nationwide Probate Real Estate Intelligence, Live Auctions, Prob8 Multi-Strategy Underwriting, and Relational CRM Platform",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
