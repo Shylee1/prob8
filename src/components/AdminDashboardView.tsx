@@ -12,6 +12,7 @@ import {
   Download,
   FileCheck2,
   Gift,
+  Inbox,
   KeyRound,
   Link2,
   Plug,
@@ -22,6 +23,7 @@ import {
   Send,
   ShieldCheck,
   Smartphone,
+  Store,
   Tag,
   Trash2,
   TrendingUp,
@@ -33,11 +35,15 @@ import type {
   AffiliateReferral,
   CustomIntegration,
   LedgerTransaction,
+  LemonSqueezyOverviewResponse,
   PaymentProcessorConfig,
   PaymentProcessorId,
   PromoCode,
   RegisteredUserRecord,
   SubscriptionTier,
+  SupportTicket,
+  SupportTicketCategory,
+  SupportTicketStatus,
 } from '../types';
 import { formatCurrency, formatDateShort } from '../utils/formatters';
 import {
@@ -48,6 +54,12 @@ import {
   formatTierLabel,
   isEligibleForAffiliatePayout,
 } from '../utils/paymentAdapter';
+import {
+  SUPPORT_CATEGORY_LABELS,
+  SUPPORT_STATUS_LABELS,
+  filterAndSortSupportTickets,
+  findRefundableTransactionForTicket,
+} from '../utils/supportAndRefunds';
 
 interface EnvVarStatus {
   name: string;
@@ -57,15 +69,17 @@ interface EnvVarStatus {
   purpose: string;
 }
 
-type AdminTab = 'overview' | 'financials' | 'users' | 'affiliates' | 'promos_integrations';
+type AdminTab = 'overview' | 'financials' | 'users' | 'affiliates' | 'promos_integrations' | 'inbox';
 
 interface AdminDashboardViewProps {
+  adminEmail: string;
   users: RegisteredUserRecord[];
   promoCodes: PromoCode[];
   affiliates: AffiliateReferral[];
   customIntegrations: CustomIntegration[];
   paymentSettings: PaymentProcessorConfig;
   ledgerTransactions: LedgerTransaction[];
+  supportTickets: SupportTicket[];
   onChangeUserTier: (userId: string, tier: SubscriptionTier) => void;
   onToggleUserStatus: (userId: string) => void;
   onTriggerPasswordReset: (userId: string) => void;
@@ -77,6 +91,19 @@ interface AdminDashboardViewProps {
   onUpdateCustomIntegrationStatus: (id: string, statusText: string) => void;
   onDeleteCustomIntegration: (id: string) => void;
   onSavePaymentSettings: (cfg: PaymentProcessorConfig) => void;
+  onUpdateSupportTicket: (
+    ticketId: string,
+    patch: { status: SupportTicketStatus; adminResponse?: string }
+  ) => Promise<void>;
+  onIssueRefund: (input: {
+    transactionId?: string;
+    externalOrderId?: string;
+    ticketId?: string;
+    userEmail?: string;
+    amountUsd?: number;
+    reason?: string;
+    downgradeToFree?: boolean;
+  }) => Promise<{ ok: boolean; message: string }>;
 }
 
 function downloadTextFile(filename: string, content: string, mimeType: string) {
@@ -90,12 +117,14 @@ function downloadTextFile(filename: string, content: string, mimeType: string) {
 }
 
 export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
+  adminEmail,
   users,
   promoCodes,
   affiliates,
   customIntegrations,
   paymentSettings,
   ledgerTransactions,
+  supportTickets,
   onChangeUserTier,
   onToggleUserStatus,
   onTriggerPasswordReset,
@@ -107,6 +136,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   onUpdateCustomIntegrationStatus,
   onDeleteCustomIntegration,
   onSavePaymentSettings,
+  onUpdateSupportTicket,
+  onIssueRefund,
 }) => {
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [userSearch, setUserSearch] = useState('');
@@ -146,9 +177,28 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   const [envVars, setEnvVars] = useState<EnvVarStatus[]>([]);
   const [isRefreshingEnv, setIsRefreshingEnv] = useState(false);
 
+  // Support Inbox & Refund Desk State
+  const [ticketCatFilter, setTicketCatFilter] = useState<'all' | SupportTicketCategory>('all');
+  const [ticketStatusFilter, setTicketStatusFilter] = useState<'all' | SupportTicketStatus>('all');
+  const [ticketSearch, setTicketSearch] = useState('');
+  const [selectedTicketId, setSelectedTicketId] = useState<string | null>(
+    () => supportTickets[0]?.id ?? null
+  );
+  const [replyDraft, setReplyDraft] = useState('');
+  const [statusDraft, setStatusDraft] = useState<SupportTicketStatus>('in_review');
+  const [overrideOrderId, setOverrideOrderId] = useState('');
+  const [downgradeOnRefund, setDowngradeOnRefund] = useState(true);
+  const [isProcessingTicket, setIsProcessingTicket] = useState(false);
+
+  // Lemon Squeezy Live Overview State
+  const [lsOverview, setLsOverview] = useState<LemonSqueezyOverviewResponse | null>(null);
+  const [isLoadingLs, setIsLoadingLs] = useState(false);
+  const [confirmingRefundKey, setConfirmingRefundKey] = useState<string | null>(null);
+  const [refundingKey, setRefundingKey] = useState<string | null>(null);
+
   const notify = (msg: string) => {
     setAdminToast(msg);
-    setTimeout(() => setAdminToast(null), 3500);
+    setTimeout(() => setAdminToast(null), 4500);
   };
 
   const loadEnvStatus = async () => {
@@ -165,9 +215,27 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
     }
   };
 
+  const loadLemonSqueezyOverview = async () => {
+    setIsLoadingLs(true);
+    try {
+      const resp = await fetch('/api/admin/lemonsqueezy/overview', {
+        headers: { 'x-prob8-admin-email': adminEmail },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as LemonSqueezyOverviewResponse;
+        setLsOverview(data);
+      }
+    } catch {
+      // Leave null if offline
+    } finally {
+      setIsLoadingLs(false);
+    }
+  };
+
   useEffect(() => {
     void loadEnvStatus();
-  }, []);
+    void loadLemonSqueezyOverview();
+  }, [adminEmail]);
 
   const kpis = useMemo(() => {
     const activePro = users.filter((u) => u.subscriptionTier === 'pro' && u.status !== 'suspended').length;
@@ -234,11 +302,13 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
       const data = (await resp.json()) as {
         countiesScanned: number;
         newFilingsIngested: number;
+        existingPropertiesUpdated?: number;
         soldPropertiesPurged: number;
         auctionsUpdated: number;
+        scheduledSlots?: string[];
       };
       setSyncResult(
-        `Scanned ${data.countiesScanned.toLocaleString()} counties · Ingested ${data.newFilingsIngested} new filings · Purged ${data.soldPropertiesPurged} sold parcels · Updated ${data.auctionsUpdated} auctions.`
+        `Scanned ${data.countiesScanned.toLocaleString()} counties · +${data.newFilingsIngested} new filings · ${data.existingPropertiesUpdated ?? 0} existing updated · -${data.soldPropertiesPurged} unavailable purged · ${data.auctionsUpdated} live auctions refreshed (${(data.scheduledSlots ?? ['11:00 AM ET', '3:00 PM ET']).join(' & ')}).`
       );
     } finally {
       setIsSyncing(false);
@@ -307,12 +377,79 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
     }
   };
 
+  const openTicketsCount = useMemo(
+    () => supportTickets.filter((t) => t.status === 'open' || t.status === 'in_review').length,
+    [supportTickets]
+  );
+
+  const filteredTickets = useMemo(
+    () =>
+      filterAndSortSupportTickets(supportTickets, {
+        category: ticketCatFilter,
+        status: ticketStatusFilter,
+        search: ticketSearch,
+      }),
+    [supportTickets, ticketCatFilter, ticketStatusFilter, ticketSearch]
+  );
+
+  const selectedTicket = useMemo(
+    () => filteredTickets.find((t) => t.id === selectedTicketId) ?? filteredTickets[0] ?? null,
+    [filteredTickets, selectedTicketId]
+  );
+
+  useEffect(() => {
+    if (selectedTicket) {
+      setReplyDraft(selectedTicket.adminResponse || '');
+      setStatusDraft(selectedTicket.status === 'open' ? 'in_review' : selectedTicket.status);
+      setOverrideOrderId(selectedTicket.relatedOrderId || '');
+    }
+  }, [selectedTicket?.id]);
+
+  const handleSaveTicketUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedTicket) return;
+    setIsProcessingTicket(true);
+    try {
+      await onUpdateSupportTicket(selectedTicket.id, {
+        status: statusDraft,
+        adminResponse: replyDraft.trim(),
+      });
+      notify(`Updated ticket from ${selectedTicket.userEmail} (${SUPPORT_STATUS_LABELS[statusDraft]}).`);
+    } finally {
+      setIsProcessingTicket(false);
+    }
+  };
+
+  const handleCancelLsSubscription = async (subId: string) => {
+    setRefundingKey(`sub-${subId}`);
+    try {
+      const resp = await fetch(`/api/admin/lemonsqueezy/subscriptions/${encodeURIComponent(subId)}/cancel`, {
+        method: 'POST',
+        headers: { 'x-prob8-admin-email': adminEmail },
+      });
+      const data = (await resp.json()) as { ok?: boolean; error?: string; message?: string };
+      if (!resp.ok || !data.ok) {
+        notify(data.error || 'Could not cancel Lemon Squeezy subscription.');
+        return;
+      }
+      notify(data.message || `Cancelled Lemon Squeezy subscription #${subId}.`);
+      await loadLemonSqueezyOverview();
+    } finally {
+      setRefundingKey(null);
+    }
+  };
+
   const tabs: Array<{ id: AdminTab; label: string; icon: React.ReactNode }> = [
     { id: 'overview', label: '1. Overview', icon: <BarChart3 className="h-4 w-4" /> },
     { id: 'financials', label: '2. Financial & Accounting', icon: <DollarSign className="h-4 w-4" /> },
     { id: 'users', label: '3. User Management', icon: <Users className="h-4 w-4" /> },
     { id: 'affiliates', label: '4. Affiliates & Dossiers', icon: <Award className="h-4 w-4" /> },
     { id: 'promos_integrations', label: '5. Promos & Integrations', icon: <Plug className="h-4 w-4" /> },
+    {
+      id: 'inbox',
+      label: openTicketsCount > 0 ? `6. Inbox & Refunds (${openTicketsCount})` : '6. Inbox & Refunds',
+      icon: <Inbox className="h-4 w-4" />,
+    },
   ];
 
   const chartBars = [
@@ -611,6 +748,220 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             </div>
           </section>
 
+          {/* Lemon Squeezy Store, Orders, Subscriptions & Direct Refunds */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-display text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <Store className="h-4 w-4 text-[#0F766E] dark:text-emerald-400" />
+                  Lemon Squeezy Merchant Account, Orders &amp; Direct Refunds
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Connected server-side via <code className="font-mono font-semibold">LEMONSQUEEZY_API_KEY</code> so your secret key is never exposed in browser code.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {lsOverview && (
+                  <span
+                    className={`rounded-lg border px-2.5 py-1 font-mono text-[11px] font-bold uppercase ${
+                      !lsOverview.configured
+                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                        : lsOverview.mode === 'live'
+                          ? 'border-emerald-500/30 bg-emerald-500/10 text-[#0F766E] dark:text-emerald-400'
+                          : 'border-indigo-500/30 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300'
+                    }`}
+                  >
+                    {!lsOverview.configured
+                      ? 'KEY NEEDED IN ENV'
+                      : lsOverview.mode === 'live'
+                        ? 'LIVE MODE ACTIVE'
+                        : 'TEST MODE KEY ACTIVE'}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void loadLemonSqueezyOverview()}
+                  disabled={isLoadingLs}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 px-3 text-xs font-semibold text-slate-800 dark:text-white hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${isLoadingLs ? 'animate-spin' : ''}`} />
+                  {isLoadingLs ? 'Syncing...' : 'Refresh Lemon Squeezy'}
+                </button>
+              </div>
+            </div>
+
+            {!lsOverview?.configured ? (
+              <div className="rounded-xl border border-amber-500/30 bg-amber-50/70 dark:bg-amber-950/25 p-4 text-xs text-amber-950 dark:text-amber-200 space-y-1.5">
+                <p className="font-bold">
+                  Server Environment Variable <code className="font-mono">LEMONSQUEEZY_API_KEY</code> Not Set Yet
+                </p>
+                <p className="leading-relaxed">
+                  Add <code className="font-mono font-bold">LEMONSQUEEZY_API_KEY</code> in your hosting/Vercel Secrets or local <code className="font-mono">.env</code> and restart the server. Once set, live Lemon Squeezy stores, orders, subscriptions, and 1-click full refunds run right from this screen. (Until your Lemon Squeezy store finishes KYC activation and flips from Test Mode to Live Mode, keys generated in Test Mode work exclusively with Test Mode orders.)
+                </p>
+              </div>
+            ) : lsOverview.error ? (
+              <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-xs text-rose-700 dark:text-rose-300">
+                Lemon Squeezy API check: <strong>{lsOverview.error}</strong>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#090D16] p-3">
+                    <p className="text-[11px] text-slate-500">Merchant Account</p>
+                    <p className="font-semibold text-slate-900 dark:text-white">
+                      {lsOverview.account?.name || 'Connected'} {lsOverview.account?.email ? `(${lsOverview.account.email})` : ''}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#090D16] p-3">
+                    <p className="text-[11px] text-slate-500">Stores Connected</p>
+                    <p className="font-semibold text-slate-900 dark:text-white">
+                      {lsOverview.stores.length > 0
+                        ? lsOverview.stores.map((s) => `${s.name} (${s.currency})`).join(', ')
+                        : 'No stores returned yet'}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#090D16] p-3">
+                    <p className="text-[11px] text-slate-500">Orders &amp; Subscriptions</p>
+                    <p className="font-mono font-bold text-[#0F766E] dark:text-emerald-400">
+                      {lsOverview.orders.length} Orders · {lsOverview.subscriptions.length} Subscriptions
+                    </p>
+                  </div>
+                </div>
+
+                {lsOverview.orders.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 dark:border-slate-800 text-left text-slate-500 dark:text-slate-400">
+                          <th className="py-2 pr-3">Order #</th>
+                          <th className="py-2 pr-3">Customer</th>
+                          <th className="py-2 pr-3">Product</th>
+                          <th className="py-2 pr-3">Total</th>
+                          <th className="py-2 pr-3">Mode</th>
+                          <th className="py-2 pr-3">Status</th>
+                          <th className="py-2">Refund</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                        {lsOverview.orders.map((ord) => {
+                          const key = `ls-ord-${ord.id}`;
+                          const confirming = confirmingRefundKey === key;
+                          return (
+                            <tr key={ord.id}>
+                              <td className="py-2.5 pr-3 font-mono font-semibold">#{ord.orderNumber}</td>
+                              <td className="py-2.5 pr-3">{ord.userEmail}</td>
+                              <td className="py-2.5 pr-3">{ord.productName}</td>
+                              <td className="py-2.5 pr-3 font-mono">{ord.totalFormatted}</td>
+                              <td className="py-2.5 pr-3 font-mono text-[11px]">
+                                {ord.testMode ? 'TEST' : 'LIVE'}
+                              </td>
+                              <td className="py-2.5 pr-3 font-mono font-bold uppercase">
+                                {ord.refunded ? 'REFUNDED' : ord.statusFormatted}
+                              </td>
+                              <td className="py-2.5">
+                                {ord.refunded ? (
+                                  <span className="text-[11px] text-slate-400">Refunded</span>
+                                ) : confirming ? (
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      disabled={refundingKey === key}
+                                      onClick={async () => {
+                                        setRefundingKey(key);
+                                        try {
+                                          const res = await onIssueRefund({
+                                            externalOrderId: ord.id,
+                                            userEmail: ord.userEmail,
+                                            amountUsd: ord.totalUsd,
+                                            reason: `Admin refund for Order #${ord.orderNumber}`,
+                                            downgradeToFree: true,
+                                          });
+                                          notify(res.message);
+                                          setConfirmingRefundKey(null);
+                                          await loadLemonSqueezyOverview();
+                                        } finally {
+                                          setRefundingKey(null);
+                                        }
+                                      }}
+                                      className="h-7 rounded-lg bg-rose-600 px-2.5 text-[11px] font-semibold text-white hover:bg-rose-500"
+                                    >
+                                      {refundingKey === key ? 'Refunding...' : 'Confirm Full Refund'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmingRefundKey(null)}
+                                      className="h-7 rounded-lg border border-slate-200 dark:border-slate-700 px-2 text-[11px]"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmingRefundKey(key)}
+                                    className="inline-flex h-7 items-center gap-1 rounded-lg border border-rose-200 dark:border-rose-900 px-2.5 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                                  >
+                                    <RotateCcw className="h-3 w-3" />
+                                    Issue Refund
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {lsOverview.subscriptions.length > 0 && (
+                  <div className="border-t border-slate-100 dark:border-slate-800 pt-3 overflow-x-auto">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">
+                      Lemon Squeezy Subscriptions ({lsOverview.subscriptions.length})
+                    </h3>
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 dark:border-slate-800 text-left text-slate-500 dark:text-slate-400">
+                          <th className="py-2 pr-3">Subscriber</th>
+                          <th className="py-2 pr-3">Plan</th>
+                          <th className="py-2 pr-3">Status</th>
+                          <th className="py-2 pr-3">Renews / Ends</th>
+                          <th className="py-2">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                        {lsOverview.subscriptions.map((sub) => (
+                          <tr key={sub.id}>
+                            <td className="py-2 pr-3">{sub.userEmail}</td>
+                            <td className="py-2 pr-3">{sub.productName}</td>
+                            <td className="py-2 pr-3 font-mono font-bold uppercase">{sub.statusFormatted}</td>
+                            <td className="py-2 pr-3 font-mono">
+                              {sub.renewsAt ? formatDateShort(sub.renewsAt) : sub.endsAt ? formatDateShort(sub.endsAt) : '—'}
+                            </td>
+                            <td className="py-2">
+                              {sub.cancelled ? (
+                                <span className="text-[11px] text-slate-400">Cancelled</span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={refundingKey === `sub-${sub.id}`}
+                                  onClick={() => void handleCancelLsSubscription(sub.id)}
+                                  className="h-7 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+                                >
+                                  {refundingKey === `sub-${sub.id}` ? 'Cancelling...' : 'Cancel Subscription'}
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
           {/* Accounting Exports & Ledger Table */}
           <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -688,25 +1039,86 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
                       <th className="py-2.5 pr-4">Gross</th>
                       <th className="py-2.5 pr-4">Fees</th>
                       <th className="py-2.5 pr-4">Net</th>
-                      <th className="py-2.5">Status</th>
+                      <th className="py-2.5 pr-4">Status</th>
+                      <th className="py-2.5">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-mono">
-                    {ledgerTransactions.map((t) => (
-                      <tr key={t.id}>
-                        <td className="py-2.5 pr-4">{formatDateShort(t.date)}</td>
-                        <td className="py-2.5 pr-4 font-sans">{t.userEmail}</td>
-                        <td className="py-2.5 pr-4 font-sans font-semibold">{t.plan}</td>
-                        <td className="py-2.5 pr-4 uppercase">{t.processor}</td>
-                        <td className="py-2.5 pr-4">{t.promoCode || '—'}</td>
-                        <td className="py-2.5 pr-4">{formatCurrency(t.grossUsd)}</td>
-                        <td className="py-2.5 pr-4 text-rose-500">{formatCurrency(t.feeUsd)}</td>
-                        <td className="py-2.5 pr-4 font-bold text-[#0F766E] dark:text-emerald-400">
-                          {formatCurrency(t.netUsd)}
-                        </td>
-                        <td className="py-2.5 uppercase font-bold">{t.status}</td>
-                      </tr>
-                    ))}
+                    {ledgerTransactions.map((t) => {
+                      const canRefund = t.status === 'paid' && t.grossUsd > 0;
+                      const confirming = confirmingRefundKey === t.id;
+                      return (
+                        <tr key={t.id}>
+                          <td className="py-2.5 pr-4">{formatDateShort(t.date)}</td>
+                          <td className="py-2.5 pr-4 font-sans">{t.userEmail}</td>
+                          <td className="py-2.5 pr-4 font-sans font-semibold">{t.plan}</td>
+                          <td className="py-2.5 pr-4 uppercase">{t.processor}</td>
+                          <td className="py-2.5 pr-4">{t.promoCode || '—'}</td>
+                          <td className="py-2.5 pr-4">{formatCurrency(t.grossUsd)}</td>
+                          <td className="py-2.5 pr-4 text-rose-500">{formatCurrency(t.feeUsd)}</td>
+                          <td className="py-2.5 pr-4 font-bold text-[#0F766E] dark:text-emerald-400">
+                            {formatCurrency(t.netUsd)}
+                          </td>
+                          <td
+                            className={`py-2.5 pr-4 uppercase font-bold ${
+                              t.status === 'refunded' ? 'text-rose-500' : ''
+                            }`}
+                          >
+                            {t.status}
+                          </td>
+                          <td className="py-2.5 font-sans">
+                            {canRefund ? (
+                              confirming ? (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    disabled={refundingKey === t.id}
+                                    onClick={async () => {
+                                      setRefundingKey(t.id);
+                                      try {
+                                        const res = await onIssueRefund({
+                                          transactionId: t.id,
+                                          externalOrderId: t.externalOrderId,
+                                          userEmail: t.userEmail,
+                                          amountUsd: t.grossUsd,
+                                          reason: 'Admin ledger refund',
+                                          downgradeToFree: true,
+                                        });
+                                        notify(res.message);
+                                        setConfirmingRefundKey(null);
+                                      } finally {
+                                        setRefundingKey(null);
+                                      }
+                                    }}
+                                    className="h-7 rounded-lg bg-rose-600 px-2.5 text-[11px] font-semibold text-white hover:bg-rose-500"
+                                  >
+                                    {refundingKey === t.id ? 'Processing...' : 'Confirm Refund'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmingRefundKey(null)}
+                                    className="h-7 rounded-lg border border-slate-200 dark:border-slate-700 px-2 text-[11px]"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmingRefundKey(t.id)}
+                                  className="inline-flex h-7 items-center gap-1 rounded-lg border border-rose-200 dark:border-rose-900 px-2.5 text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                                >
+                                  <RotateCcw className="h-3 w-3" />
+                                  Issue Refund
+                                </button>
+                              )
+                            ) : (
+                              <span className="text-[11px] text-slate-400">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1403,6 +1815,293 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
               </ul>
             </section>
           </div>
+        </div>
+      )}
+
+      {/* PAGE 6: USER SUGGESTIONS, CONTACT INBOX & REFUND PROCESSING */}
+      {activeTab === 'inbox' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* Left: Inbox Queue */}
+          <section className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-display text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <Inbox className="h-4 w-4 text-[#0F766E] dark:text-emerald-400" />
+                  Support, Suggestions &amp; Refund Inbox ({filteredTickets.length})
+                </h2>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Direct user submissions from in-app embedded forms.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+              <select
+                aria-label="Filter inbox by category"
+                value={ticketCatFilter}
+                onChange={(e) => setTicketCatFilter(e.target.value as typeof ticketCatFilter)}
+                className="h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] px-2.5 font-semibold"
+              >
+                <option value="all">All Categories</option>
+                <option value="refund_request">Refund Requests</option>
+                <option value="feature_suggestion">Feature Suggestions</option>
+                <option value="billing_support">Billing Questions</option>
+                <option value="bug_report">Bug / Data Reports</option>
+                <option value="general">General Contact</option>
+              </select>
+
+              <select
+                aria-label="Filter inbox by status"
+                value={ticketStatusFilter}
+                onChange={(e) => setTicketStatusFilter(e.target.value as typeof ticketStatusFilter)}
+                className="h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] px-2.5 font-semibold"
+              >
+                <option value="all">All Statuses</option>
+                <option value="open">Open</option>
+                <option value="in_review">In Review</option>
+                <option value="resolved">Resolved</option>
+                <option value="refunded">Refunded</option>
+              </select>
+            </div>
+
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <input
+                type="text"
+                aria-label="Search support inbox"
+                value={ticketSearch}
+                onChange={(e) => setTicketSearch(e.target.value)}
+                placeholder="Search user email, subject, order #..."
+                className="w-full h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] pl-9 pr-3 text-xs"
+              />
+            </div>
+
+            {filteredTickets.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 p-6 text-center text-xs text-slate-500">
+                No user messages or refund requests match this filter yet.
+              </div>
+            ) : (
+              <div className="space-y-2.5 max-h-[540px] overflow-y-auto pr-1">
+                {filteredTickets.map((tkt) => {
+                  const selected = selectedTicket?.id === tkt.id;
+                  return (
+                    <button
+                      key={tkt.id}
+                      type="button"
+                      onClick={() => setSelectedTicketId(tkt.id)}
+                      className={`w-full rounded-xl border p-3.5 text-left space-y-1 transition-colors ${
+                        selected
+                          ? 'border-[#0F766E] bg-[#0F766E]/10 dark:bg-emerald-950/25'
+                          : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-[#090D16]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[10px] font-mono uppercase">
+                        <span
+                          className={`font-bold ${
+                            tkt.category === 'refund_request'
+                              ? 'text-rose-600 dark:text-rose-400'
+                              : 'text-indigo-600 dark:text-indigo-400'
+                          }`}
+                        >
+                          {SUPPORT_CATEGORY_LABELS[tkt.category]}
+                        </span>
+                        <span className="font-bold text-slate-500 dark:text-slate-400">
+                          {SUPPORT_STATUS_LABELS[tkt.status]}
+                        </span>
+                      </div>
+                      <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                        {tkt.subject}
+                      </p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate font-mono">
+                        {tkt.userEmail} · {formatDateShort(tkt.createdAt)}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* Right: Ticket Inspector, Reply & 1-Click Refund Execution */}
+          <section className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-5">
+            {!selectedTicket ? (
+              <p className="text-xs text-slate-500">
+                Select a message from the inbox queue to review details, reply in-app, or issue a refund.
+              </p>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
+                  <div className="space-y-1">
+                    <span className="font-mono text-[11px] font-bold uppercase text-[#0F766E] dark:text-emerald-400">
+                      {SUPPORT_CATEGORY_LABELS[selectedTicket.category]} · {SUPPORT_STATUS_LABELS[selectedTicket.status]}
+                    </span>
+                    <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+                      {selectedTicket.subject}
+                    </h2>
+                    <p className="font-mono text-xs text-slate-500 dark:text-slate-400">
+                      From {selectedTicket.userName} ({selectedTicket.userEmail}) · Plan: {formatTierLabel(selectedTicket.subscriptionTier)} · {formatDateShort(selectedTicket.createdAt)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#090D16] p-4 text-xs text-slate-800 dark:text-slate-200 whitespace-pre-wrap leading-relaxed">
+                  {selectedTicket.message}
+                </div>
+
+                {(selectedTicket.category === 'refund_request' ||
+                  selectedTicket.relatedTransactionId ||
+                  selectedTicket.relatedOrderId ||
+                  selectedTicket.requestedRefundUsd) && (
+                  <div className="rounded-xl border border-rose-500/25 bg-rose-500/5 p-4 space-y-3 text-xs">
+                    {(() => {
+                      const matchedTxn = findRefundableTransactionForTicket(
+                        selectedTicket,
+                        ledgerTransactions
+                      );
+                      const resolvedOrderId =
+                        overrideOrderId.trim() ||
+                        selectedTicket.relatedOrderId ||
+                        matchedTxn?.externalOrderId ||
+                        '';
+
+                      return (
+                        <>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                              <RotateCcw className="h-4 w-4 text-rose-600 dark:text-rose-400" />
+                              Refund Processing Desk
+                            </p>
+                            {selectedTicket.requestedRefundUsd !== undefined && (
+                              <span className="font-mono font-bold text-rose-700 dark:text-rose-300">
+                                Requested: {formatCurrency(selectedTicket.requestedRefundUsd)}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label
+                                htmlFor="admin-refund-order-id"
+                                className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300"
+                              >
+                                Lemon Squeezy Order ID (Optional for live API refund)
+                              </label>
+                              <input
+                                id="admin-refund-order-id"
+                                type="text"
+                                value={overrideOrderId}
+                                onChange={(e) => setOverrideOrderId(e.target.value)}
+                                placeholder={matchedTxn?.externalOrderId || 'e.g. 42001'}
+                                className="mt-1 w-full h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 font-mono text-xs"
+                              />
+                            </div>
+                            <div className="flex items-end">
+                              <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer h-9">
+                                <input
+                                  type="checkbox"
+                                  checked={downgradeOnRefund}
+                                  onChange={(e) => setDowngradeOnRefund(e.target.checked)}
+                                  className="h-4 w-4 accent-[#0F766E]"
+                                />
+                                Downgrade account to Free Tier on refund
+                              </label>
+                            </div>
+                          </div>
+
+                          {matchedTxn && (
+                            <p className="text-[11px] text-slate-600 dark:text-slate-300 font-mono">
+                              Matched Ledger Charge: {matchedTxn.plan} · {formatCurrency(matchedTxn.grossUsd)} ({matchedTxn.processor.toUpperCase()}) on {formatDateShort(matchedTxn.date)}
+                            </p>
+                          )}
+
+                          <button
+                            type="button"
+                            disabled={isProcessingTicket || selectedTicket.status === 'refunded'}
+                            onClick={async () => {
+                              setIsProcessingTicket(true);
+                              try {
+                                const result = await onIssueRefund({
+                                  transactionId: matchedTxn?.id,
+                                  externalOrderId: resolvedOrderId || undefined,
+                                  ticketId: selectedTicket.id,
+                                  userEmail: selectedTicket.userEmail,
+                                  amountUsd: selectedTicket.requestedRefundUsd ?? matchedTxn?.grossUsd,
+                                  reason: replyDraft.trim() || `Refund approved for ${selectedTicket.userEmail}`,
+                                  downgradeToFree: downgradeOnRefund,
+                                });
+                                notify(result.message);
+                                if (result.ok) {
+                                  setStatusDraft('refunded');
+                                  if (!replyDraft.trim()) {
+                                    setReplyDraft('Your refund has been issued and confirmed.');
+                                  }
+                                  await loadLemonSqueezyOverview();
+                                }
+                              } finally {
+                                setIsProcessingTicket(false);
+                              }
+                            }}
+                            className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-rose-600 px-4 text-xs font-semibold text-white hover:bg-rose-500 disabled:opacity-50"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            {selectedTicket.status === 'refunded'
+                              ? 'Already Refunded'
+                              : isProcessingTicket
+                                ? 'Issuing Refund...'
+                                : resolvedOrderId
+                                  ? `Issue Lemon Squeezy Refund (#${resolvedOrderId})`
+                                  : 'Approve Refund & Reconcile Ledger'}
+                          </button>
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
+
+                <form onSubmit={(e) => void handleSaveTicketUpdate(e)} className="space-y-3 text-xs">
+                  <div>
+                    <label
+                      htmlFor="admin-ticket-reply"
+                      className="block font-semibold text-slate-700 dark:text-slate-300"
+                    >
+                      In-App Response to User (Visible inside their Request Tracker)
+                    </label>
+                    <textarea
+                      id="admin-ticket-reply"
+                      rows={4}
+                      value={replyDraft}
+                      onChange={(e) => setReplyDraft(e.target.value)}
+                      placeholder="Write a clear reply or resolution note for this user..."
+                      className="mt-1 w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] p-3 text-xs text-slate-900 dark:text-white"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <select
+                      aria-label="Update ticket status"
+                      value={statusDraft}
+                      onChange={(e) => setStatusDraft(e.target.value as SupportTicketStatus)}
+                      className="h-10 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] px-3 font-semibold"
+                    >
+                      <option value="open">Status: Open</option>
+                      <option value="in_review">Status: In Review</option>
+                      <option value="resolved">Status: Resolved</option>
+                      <option value="refunded">Status: Refunded</option>
+                    </select>
+
+                    <button
+                      type="submit"
+                      disabled={isProcessingTicket}
+                      className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-[#0F766E] px-5 font-semibold text-white hover:bg-[#0D625B] disabled:opacity-50"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                      {isProcessingTicket ? 'Saving...' : 'Save Reply & Status'}
+                    </button>
+                  </div>
+                </form>
+              </>
+            )}
+          </section>
         </div>
       )}
     </div>

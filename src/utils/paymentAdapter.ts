@@ -255,3 +255,33 @@ This Agreement is governed by applicable federal statutes and the commercial con
 4. FTC 16 CFR PART 255 & ANTI-SPAM COMPLIANCE
 Affiliate must clearly and conspicuously disclose material connections ("I may earn a commission if you subscribe to Prob8 via my link") on every blog, video, email, or social promotion, and comply with CAN-SPAM and TCPA rules.`;
 }
+
+export interface ReferralAttribution {
+  refCode?: string;
+  lemonSqueezyAffId?: string;
+}
+
+export function extractReferralParams(search: string): ReferralAttribution {
+  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  const rawRef = params.get('ref')?.trim();
+  const rawAff = params.get('aff')?.trim();
+  return {
+    refCode: rawRef ? rawRef.toUpperCase() : undefined,
+    lemonSqueezyAffId: rawAff || undefined,
+  };
+}
+
+export function getLemonSqueezyAffiliateId(win?: unknown): string | undefined {
+  const target = (win ?? (typeof window !== 'undefined' ? window : undefined)) as
+    | { LemonSqueezy?: { Affiliate?: { GetId?: () => unknown } } }
+    | undefined;
+  try {
+    const id = target?.LemonSqueezy?.Affiliate?.GetId?.();
+    if (typeof id === 'string' && id.trim()) return id.trim();
+    if (typeof id === 'number' && Number.isFinite(id)) return String(id);
+  } catch {
+    // ignore if LemonSqueezy affiliate script has not initialized
+  }
+  return undefined;
+}
+

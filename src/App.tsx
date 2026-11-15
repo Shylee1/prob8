@@ -36,6 +36,7 @@ import {
   loadLedgerTransactions,
   loadPaymentSettings,
   loadPromoCodes,
+  loadSupportTickets,
   loadUserWorkspace,
   saveAffiliates,
   saveCustomIntegrations,
@@ -43,6 +44,7 @@ import {
   savePaymentSettings,
   savePromoCodes,
   saveRegisteredUsers,
+  saveSupportTickets,
   saveUserWorkspace,
   setActiveSessionEmail,
   updateUserTierRemote,
@@ -76,16 +78,23 @@ import type {
   PropertyRecord,
   RegisteredUserRecord,
   SubscriptionTier,
+  SupportTicket,
+  SupportTicketCategory,
+  SupportTicketStatus,
 } from './types';
 import { findMatchingBuyBoxes, matchesBuyBoxFilters } from './utils/buyBoxMatcher';
+import { calculateMotivationScore } from './utils/motivationScore';
 import {
   AFFILIATE_LIFETIME_FLAT_USD,
   AFFILIATE_PRO_RECURRING_PCT,
   PRO_MONTHLY_USD,
   calculateCheckoutTotals,
+  extractReferralParams,
+  getLemonSqueezyAffiliateId,
   validatePromoCode,
 } from './utils/paymentAdapter';
 import { applyFreemiumResultGating } from './utils/resultGating';
+import { applyLocalTransactionRefund } from './utils/supportAndRefunds';
 
 const AdminDashboardView = lazy(() =>
   import('./components/AdminDashboardView').then((m) => ({ default: m.AdminDashboardView }))
@@ -102,11 +111,15 @@ const LegalDisclosuresView = lazy(() =>
 const SettingsView = lazy(() =>
   import('./components/SettingsView').then((m) => ({ default: m.SettingsView }))
 );
+const SupportContactPanel = lazy(() =>
+  import('./components/SupportContactPanel').then((m) => ({ default: m.SupportContactPanel }))
+);
 const PropertyDossierModal = lazy(() =>
   import('./components/PropertyDossierModal').then((m) => ({ default: m.PropertyDossierModal }))
 );
 
-const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '';
+const GOOGLE_MAPS_API_KEY = ((import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '').trim();
+const HAS_GOOGLE_MAPS_KEY = Boolean(GOOGLE_MAPS_API_KEY);
 const THEME_STORAGE_KEY = 'prob8_theme';
 
 function ViewLoadingFallback() {
@@ -151,11 +164,11 @@ export default function App() {
     }
   }, [isDark]);
 
-  // Referral ?ref=CODE tracking
+  // Referral ?ref=CODE and Lemon Squeezy ?aff=ID tracking
   const referredByCode = useMemo(() => {
     if (typeof window === 'undefined') return undefined;
-    const code = new URLSearchParams(window.location.search).get('ref');
-    return code ? code.trim().toUpperCase() : undefined;
+    const { refCode, lemonSqueezyAffId } = extractReferralParams(window.location.search);
+    return refCode ?? lemonSqueezyAffId ?? getLemonSqueezyAffiliateId(window);
   }, []);
 
   // Registered users, Promo codes, Affiliates, Payment Settings, Ledger & Custom Integrations
@@ -172,6 +185,9 @@ export default function App() {
   );
   const [ledgerTransactions, setLedgerTransactions] = useState<LedgerTransaction[]>(() =>
     loadLedgerTransactions()
+  );
+  const [supportTickets, setSupportTickets] = useState<SupportTicket[]>(() =>
+    loadSupportTickets()
   );
   const [showPublicAffiliatePortal, setShowPublicAffiliatePortal] = useState<boolean>(false);
 
@@ -237,6 +253,10 @@ export default function App() {
   } | null>(null);
   const [activeBuyBoxFilterId, setActiveBuyBoxFilterId] = useState<string>('');
   const [auctionFilterOnly, setAuctionFilterOnly] = useState<boolean>(false);
+  const [sortBy, setSortBy] = useState<'motivation' | 'equity' | 'newest' | 'lowest_ask'>('motivation');
+  const [minEquityFilter, setMinEquityFilter] = useState<number>(0);
+  const [distressFilter, setDistressFilter] = useState<'all' | 'tax_delinquent' | 'vacant' | 'pre_fc'>('all');
+  const [hostedCheckoutNotice, setHostedCheckoutNotice] = useState<{ plan: string; url: string } | null>(null);
 
   // Listen for Google Maps Demo Key Quota Exceeded event
   useEffect(() => {
@@ -294,7 +314,7 @@ export default function App() {
             lat: params.lat,
             lng: params.lng,
             cursor: params.cursor ?? 0,
-            limit: 60,
+            limit: 250,
           }),
         });
         if (!resp.ok) {
@@ -456,12 +476,22 @@ export default function App() {
   );
 
   const filteredProperties = useMemo(() => {
-    return properties.filter((p) => {
+    const filtered = properties.filter((p) => {
       if (auctionFilterOnly && p.status !== 'auction') return false;
+      if (minEquityFilter > 0 && p.equityPct < minEquityFilter) return false;
+      if (distressFilter === 'tax_delinquent' && !p.taxDelinquent) return false;
+      if (distressFilter === 'vacant' && !p.isVacant) return false;
+      if (distressFilter === 'pre_fc' && !p.preForeclosureOverlap) return false;
       if (activeBuyBoxFilter && !matchesBuyBoxFilters(p, activeBuyBoxFilter.filters)) return false;
       return true;
     });
-  }, [properties, auctionFilterOnly, activeBuyBoxFilter]);
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'equity') return b.equityPct - a.equityPct;
+      if (sortBy === 'newest') return Date.parse(b.filingDate) - Date.parse(a.filingDate);
+      if (sortBy === 'lowest_ask') return a.probatePrice - b.probatePrice;
+      return calculateMotivationScore(b).score - calculateMotivationScore(a).score;
+    });
+  }, [properties, auctionFilterOnly, minEquityFilter, distressFilter, activeBuyBoxFilter, sortBy]);
 
   const gatedResults = useMemo(() => {
     const tier: SubscriptionTier = workspace?.profile.subscriptionTier ?? 'free';
@@ -672,6 +702,247 @@ export default function App() {
     savePaymentSettings(cfg);
   }, []);
 
+  // Sync Support Tickets from server store cleanly when activeUser changes
+  useEffect(() => {
+    if (!activeUser) return;
+    let active = true;
+    const isAdminUser = isFounderAdminEmail(activeUser.email);
+    const endpoint = isAdminUser
+      ? '/api/admin/support/tickets'
+      : `/api/support/my-tickets?email=${encodeURIComponent(activeUser.email)}`;
+    const headers: Record<string, string> = isAdminUser
+      ? { 'x-prob8-admin-email': activeUser.email }
+      : {};
+
+    fetch(endpoint, { headers })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { tickets?: SupportTicket[] } | null) => {
+        if (!active || !data?.tickets?.length) return;
+        setSupportTickets((prev) => {
+          const map = new Map<string, SupportTicket>();
+          for (const item of prev) map.set(item.id, item);
+          for (const remote of data.tickets!) map.set(remote.id, remote);
+          const merged = Array.from(map.values()).sort(
+            (a, b) => Date.parse(b.updatedAt || b.createdAt) - Date.parse(a.updatedAt || a.createdAt)
+          );
+          saveSupportTickets(merged);
+          return merged;
+        });
+      })
+      .catch(() => null);
+
+    return () => {
+      active = false;
+    };
+  }, [activeUser?.email]);
+
+  const handleSubmitSupportTicket = useCallback(
+    async (input: {
+      category: SupportTicketCategory;
+      subject: string;
+      message: string;
+      relatedTransactionId?: string;
+      relatedOrderId?: string;
+      requestedRefundUsd?: number;
+    }): Promise<{ ok: boolean; error?: string; ticket?: SupportTicket }> => {
+      if (!activeUser || !workspace) {
+        return { ok: false, error: 'Sign in required.' };
+      }
+      const id = createId('tkt');
+      try {
+        const resp = await fetch('/api/support/tickets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id,
+            userId: activeUser.id,
+            userEmail: activeUser.email,
+            userName: workspace.profile.fullName,
+            subscriptionTier: workspace.profile.subscriptionTier,
+            ...input,
+          }),
+        });
+        const data = (await resp.json()) as {
+          ok?: boolean;
+          error?: string;
+          ticket?: SupportTicket;
+        };
+        if (!resp.ok || !data.ok || !data.ticket) {
+          return { ok: false, error: data.error || 'Could not submit request.' };
+        }
+        setSupportTickets((prev) => {
+          const next = [data.ticket!, ...prev.filter((t) => t.id !== data.ticket!.id)];
+          saveSupportTickets(next);
+          return next;
+        });
+        return { ok: true, ticket: data.ticket };
+      } catch {
+        const now = new Date().toISOString();
+        const fallbackTicket: SupportTicket = {
+          id,
+          userId: activeUser.id,
+          userEmail: activeUser.email,
+          userName: workspace.profile.fullName,
+          subscriptionTier: workspace.profile.subscriptionTier,
+          category: input.category,
+          subject: input.subject,
+          message: input.message,
+          relatedTransactionId: input.relatedTransactionId,
+          relatedOrderId: input.relatedOrderId,
+          requestedRefundUsd: input.requestedRefundUsd,
+          status: 'open',
+          createdAt: now,
+          updatedAt: now,
+        };
+        setSupportTickets((prev) => {
+          const next = [fallbackTicket, ...prev];
+          saveSupportTickets(next);
+          return next;
+        });
+        return { ok: true, ticket: fallbackTicket };
+      }
+    },
+    [activeUser, workspace]
+  );
+
+  const handleUpdateSupportTicket = useCallback(
+    async (
+      ticketId: string,
+      patch: { status: SupportTicketStatus; adminResponse?: string }
+    ): Promise<void> => {
+      if (!activeUser || !isFounderAdminEmail(activeUser.email)) return;
+      const now = new Date().toISOString();
+      setSupportTickets((prev) => {
+        const next = prev.map((t) =>
+          t.id === ticketId
+            ? {
+                ...t,
+                status: patch.status,
+                adminResponse:
+                  patch.adminResponse !== undefined ? patch.adminResponse : t.adminResponse,
+                updatedAt: now,
+                resolvedAt:
+                  patch.status === 'resolved' || patch.status === 'refunded'
+                    ? t.resolvedAt || now
+                    : t.resolvedAt,
+              }
+            : t
+        );
+        saveSupportTickets(next);
+        return next;
+      });
+      await fetch(`/api/admin/support/tickets/${encodeURIComponent(ticketId)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-prob8-admin-email': activeUser.email,
+        },
+        body: JSON.stringify(patch),
+      }).catch(() => null);
+    },
+    [activeUser]
+  );
+
+  const handleIssueRefund = useCallback(
+    async (input: {
+      transactionId?: string;
+      externalOrderId?: string;
+      ticketId?: string;
+      userEmail?: string;
+      amountUsd?: number;
+      reason?: string;
+      downgradeToFree?: boolean;
+    }): Promise<{ ok: boolean; message: string }> => {
+      if (!activeUser || !isFounderAdminEmail(activeUser.email)) {
+        return { ok: false, message: 'Founder admin privileges required.' };
+      }
+
+      if (input.externalOrderId || input.ticketId) {
+        const resp = await fetch('/api/admin/lemonsqueezy/refund', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-prob8-admin-email': activeUser.email,
+          },
+          body: JSON.stringify({
+            orderId: input.externalOrderId,
+            amountCents:
+              input.amountUsd !== undefined && input.amountUsd > 0
+                ? Math.round(input.amountUsd * 100)
+                : undefined,
+            ticketId: input.ticketId,
+            reason: input.reason,
+          }),
+        });
+        const data = (await resp.json().catch(() => null)) as {
+          ok?: boolean;
+          error?: string;
+          remoteMessage?: string;
+        } | null;
+
+        if (!resp.ok || !data?.ok) {
+          return {
+            ok: false,
+            message: data?.error || `Refund failed (HTTP ${resp.status}).`,
+          };
+        }
+      }
+
+      if (input.transactionId || input.externalOrderId) {
+        setLedgerTransactions((prev) => {
+          const reconciled = applyLocalTransactionRefund(prev, {
+            transactionId: input.transactionId,
+            externalOrderId: input.externalOrderId,
+            amountUsd: input.amountUsd,
+            reason: input.reason,
+          });
+          saveLedgerTransactions(reconciled.transactions);
+          return reconciled.transactions;
+        });
+      }
+
+      if (input.downgradeToFree && input.userEmail) {
+        const normalizedEmail = input.userEmail.trim().toLowerCase();
+        const target = registeredUsers.find(
+          (u) => u.email.toLowerCase() === normalizedEmail && !isFounderAdminEmail(u.email)
+        );
+        if (target) {
+          handleChangeUserTier(target.id, 'free');
+        }
+      }
+
+      if (input.ticketId) {
+        const now = new Date().toISOString();
+        setSupportTickets((prev) => {
+          const next = prev.map((t) =>
+            t.id === input.ticketId
+              ? {
+                  ...t,
+                  status: 'refunded' as const,
+                  adminResponse:
+                    input.reason?.trim() ||
+                    t.adminResponse ||
+                    'Refund approved and processed from Admin Command Center.',
+                  updatedAt: now,
+                  resolvedAt: now,
+                }
+              : t
+          );
+          saveSupportTickets(next);
+          return next;
+        });
+      }
+
+      return {
+        ok: true,
+        message: input.externalOrderId
+          ? `Refund processed cleanly for Order #${input.externalOrderId}.`
+          : 'Refund approved, ledger reconciled, and customer notified in-app.',
+      };
+    },
+    [activeUser, registeredUsers, handleChangeUserTier]
+  );
+
   // Auth Gate (or Public Become-an-Affiliate Portal) when signed out
   if (!activeUser || !workspace) {
     if (showPublicAffiliatePortal) {
@@ -808,8 +1079,20 @@ export default function App() {
         promoCode: appliedPromo?.code,
         grossUsd: totals.grossUsd,
         isTrial,
+        affiliateCode:
+          workspace.profile.referredBy || getLemonSqueezyAffiliateId(window),
       }),
-    }).catch(() => null);
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((res: { checkoutUrl?: string | null } | null) => {
+        if (res?.checkoutUrl) {
+          setHostedCheckoutNotice({
+            plan: plan === 'vip_lifetime' ? 'Prob8 Lifetime ($699)' : 'Prob8 Pro ($79/mo)',
+            url: res.checkoutUrl,
+          });
+        }
+      })
+      .catch(() => null);
   };
 
   const handleNavigateView = (view: AppView) => {
@@ -1336,6 +1619,13 @@ export default function App() {
     }));
   };
 
+  const handleReorderStops = (ordered: FieldRouteStop[]) => {
+    updateWorkspace((prev) => ({
+      ...prev,
+      fieldRouteStops: ordered,
+    }));
+  };
+
   const handleQuickAddStopToPipeline = (stop: FieldRouteStop) => {
     if (stop.property) {
       handleSaveToPipeline(stop.property, 'New Probate Lead');
@@ -1440,16 +1730,10 @@ export default function App() {
   const isExclusiveAdmin =
     workspace.profile.isAdmin && isFounderAdminEmail(workspace.profile.email);
 
-  return (
-    <APIProvider
-      apiKey={GOOGLE_MAPS_API_KEY}
-      language="en"
-      region="US"
-      libraries={['places', 'marker', 'streetView', 'geocoding']}
-    >
+  const appShell = (
       <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#090D16] text-slate-900 dark:text-white transition-colors">
         {/* Mandatory Google Maps Demo Key Quota Exceeded Banner */}
-        {mapsQuotaExceeded && (
+        {HAS_GOOGLE_MAPS_KEY && mapsQuotaExceeded && (
           <div className="bg-amber-50 dark:bg-amber-950/60 border-b border-amber-200 dark:border-amber-900 px-4 py-2 text-amber-900 dark:text-amber-200 text-xs flex items-center justify-between gap-2 z-50">
             <span className="flex items-center gap-2 font-medium">
               <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700 dark:text-amber-400" />
@@ -1481,6 +1765,11 @@ export default function App() {
           peopleCount={workspace.people.length}
           portfolioCount={workspace.portfolioAssets.length}
           buyBoxCount={workspace.buyBoxes.filter((b) => b.isActive).length}
+          openSupportCount={
+            isExclusiveAdmin
+              ? supportTickets.filter((t) => t.status === 'open' || t.status === 'in_review').length
+              : 0
+          }
           subscriptionTier={workspace.profile.subscriptionTier}
           isAdmin={isExclusiveAdmin}
           isDark={isDark}
@@ -1488,6 +1777,32 @@ export default function App() {
           onOpenBillingOrAccount={() => setShowAccountModal(true)}
           userEmail={workspace.profile.email}
         />
+
+        {/* Hosted Lemon Squeezy Checkout Link Banner (when live checkout URL env var is set) */}
+        {hostedCheckoutNotice && (
+          <div className="bg-emerald-50 dark:bg-emerald-950/60 border-b border-emerald-200 dark:border-emerald-900 px-4 py-2 text-emerald-900 dark:text-emerald-200 text-xs flex items-center justify-between gap-2 z-40">
+            <span className="font-medium">
+              Live Lemon Squeezy hosted checkout ready for <strong>{hostedCheckoutNotice.plan}</strong>.
+            </span>
+            <div className="flex items-center gap-3 shrink-0">
+              <a
+                href={hostedCheckoutNotice.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded-lg bg-[#0F766E] px-3 py-1 font-semibold text-white hover:bg-[#0D625B]"
+              >
+                Complete Hosted Payment
+              </a>
+              <button
+                type="button"
+                onClick={() => setHostedCheckoutNotice(null)}
+                className="underline text-xs font-semibold"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
 
         <main className="flex-1">
           {activeView === 'discover' && (
@@ -1500,7 +1815,7 @@ export default function App() {
                     {liveCounterText}
                   </span>
                   <span className="hidden sm:inline font-mono text-[11px] text-emerald-700 dark:text-emerald-400">
-                    · {syncSummary?.statesCovered ?? 51} Jurisdictions (50 States + DC) · Auto-Sync M–F 11 AM &amp; 4 PM ET
+                    · {syncSummary?.statesCovered ?? 51} Jurisdictions (50 States + DC) · Auto-Sync M–F 11 AM &amp; 3 PM ET
                   </span>
                   {!isNationalBrowse && (
                     <>
@@ -1517,6 +1832,42 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-2 w-full sm:w-auto">
+                  <select
+                    aria-label="Sort probate properties"
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                    className="h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                  >
+                    <option value="motivation">Sort: Motivation Score</option>
+                    <option value="equity">Sort: Highest Equity %</option>
+                    <option value="newest">Sort: Newest Filing</option>
+                    <option value="lowest_ask">Sort: Lowest Ask</option>
+                  </select>
+
+                  <select
+                    aria-label="Filter by minimum equity"
+                    value={minEquityFilter}
+                    onChange={(e) => setMinEquityFilter(Number(e.target.value))}
+                    className="h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                  >
+                    <option value={0}>Equity: Any</option>
+                    <option value={30}>30%+ Equity</option>
+                    <option value={50}>50%+ Equity</option>
+                    <option value={65}>65%+ Equity</option>
+                  </select>
+
+                  <select
+                    aria-label="Filter by distress flag"
+                    value={distressFilter}
+                    onChange={(e) => setDistressFilter(e.target.value as typeof distressFilter)}
+                    className="h-9 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                  >
+                    <option value="all">Distress: All</option>
+                    <option value="tax_delinquent">Tax Delinquent</option>
+                    <option value="vacant">Vacant Estate</option>
+                    <option value="pre_fc">Pre-Foreclosure Overlap</option>
+                  </select>
+
                   <button
                     type="button"
                     onClick={() => setAuctionFilterOnly((v) => !v)}
@@ -1537,7 +1888,7 @@ export default function App() {
                         aria-label="Filter results by Buy-Box"
                         value={activeBuyBoxFilterId}
                         onChange={(e) => setActiveBuyBoxFilterId(e.target.value)}
-                        className="h-9 min-w-0 max-w-[200px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 text-xs font-medium text-slate-700 dark:text-slate-200 truncate"
+                        className="h-9 min-w-0 max-w-[180px] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] px-2.5 text-xs font-medium text-slate-700 dark:text-slate-200 truncate"
                       >
                         <option value="">All Search Results</option>
                         {workspace.buyBoxes.map((b) => (
@@ -1573,6 +1924,48 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Transparent Free Tier Missing-Out Strip vs 100% Unlocked Pro Strip */}
+              <div
+                aria-label="Tier Coverage Status"
+                className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 text-xs ${
+                  gatedResults.isGated
+                    ? 'border-amber-500/30 bg-amber-50/70 dark:bg-amber-950/25 text-amber-950 dark:text-amber-200'
+                    : 'border-emerald-500/30 bg-emerald-50/70 dark:bg-emerald-950/25 text-emerald-950 dark:text-emerald-200'
+                }`}
+              >
+                {gatedResults.isGated ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Lock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+                      <span>
+                        <strong>Free Tier Coverage:</strong> Showing{' '}
+                        <span className="font-mono font-bold">{gatedResults.unlocked.length}</span> properties (max{' '}
+                        {gatedResults.perCountyLimit}/county across {gatedResults.countiesRepresented} counties) ·{' '}
+                        <strong className="font-mono text-rose-700 dark:text-rose-300">
+                          Missing out on {gatedResults.lockedCount.toLocaleString()} of {gatedResults.totalAvailable.toLocaleString()} available
+                        </strong>
+                        .
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowAccountModal(true)}
+                      className="rounded-lg bg-[#0F766E] px-3 py-1 text-xs font-semibold text-white hover:bg-[#0D625B] shrink-0"
+                    >
+                      Unlock 100% Map &amp; List
+                    </button>
+                  </>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="h-3.5 w-3.5 text-[#0F766E] dark:text-emerald-400 shrink-0" />
+                    <span>
+                      <strong>100% Unlocked ({workspace.profile.subscriptionTier === 'vip_lifetime' ? 'VIP Lifetime' : 'Prob8 Pro'}):</strong>{' '}
+                      Displaying all <span className="font-mono font-bold">{gatedResults.unlocked.length}</span> live properties on both List &amp; Map ({gatedResults.totalAvailable.toLocaleString()} indexed across {gatedResults.countiesRepresented} counties).
+                    </span>
+                  </div>
+                )}
+              </div>
+
               {searchError && (
                 <div className="rounded-xl border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-4 py-2.5 text-xs font-medium text-amber-900 dark:text-amber-200">
                   {searchError}
@@ -1596,6 +1989,9 @@ export default function App() {
                     isSearching={isSearching}
                     savedPropertyIds={savedPropertyIds}
                     hideMapOnMobile={mobileDiscoverPane === 'list'}
+                    totalAvailable={gatedResults.totalAvailable}
+                    lockedCount={gatedResults.lockedCount}
+                    isProUnlocked={!gatedResults.isGated}
                   />
                 </div>
 
@@ -1681,13 +2077,13 @@ export default function App() {
                             </div>
                             <div className="min-w-0">
                               <h3 className="font-display text-sm font-bold leading-snug">
-                                Showing {gatedResults.unlocked.length} of {gatedResults.totalAvailable.toLocaleString()} Probate Properties in {activeMarketLabel}
+                                Showing {gatedResults.unlocked.length} of {gatedResults.totalAvailable.toLocaleString()} Probate Properties ({gatedResults.perCountyLimit}/county cap across {gatedResults.countiesRepresented} counties)
                               </h3>
                               <p className="mt-1 text-xs text-slate-300 leading-relaxed">
                                 <span className="font-mono font-bold text-[#5EEAD4]">
-                                  {gatedResults.lockedCount.toLocaleString()} High-Equity Leads Locked.
+                                  Missing out on {gatedResults.lockedCount.toLocaleString()} High-Equity Leads in {activeMarketLabel}.
                                 </span>{' '}
-                                Start your 7-Day Free Trial or upgrade to Prob8 Pro ($79/mo) to unlock 100% of every US county, AI underwriting briefs, and instant Skip Tracing.
+                                Start your 7-Day Free Trial or upgrade to Prob8 Pro ($79/mo) to unlock 100% of every US county on both Map &amp; List, AI underwriting briefs, and instant Skip Tracing.
                               </p>
                             </div>
                           </div>
@@ -1775,6 +2171,7 @@ export default function App() {
               onPinCurrentGps={handlePinCurrentGps}
               onAddPropertyStop={handleAddPropertyStop}
               onRemoveStop={handleRemoveStop}
+              onReorderStops={handleReorderStops}
               onQuickAddToPipeline={handleQuickAddStopToPipeline}
               onQuickAddToCrm={handleQuickAddStopToCrm}
               onOpenDossier={(p) => setDossierPropertyId(p.id)}
@@ -1785,7 +2182,24 @@ export default function App() {
           {activeView === 'docs' && (
             <ErrorBoundary fallbackTitle="Documentation View Error">
               <Suspense fallback={<ViewLoadingFallback />}>
-                <DocumentationView />
+                <DocumentationView onOpenSupport={() => handleNavigateView('support')} />
+              </Suspense>
+            </ErrorBoundary>
+          )}
+
+          {activeView === 'support' && (
+            <ErrorBoundary fallbackTitle="Support Desk Error">
+              <Suspense fallback={<ViewLoadingFallback />}>
+                <SupportContactPanel
+                  userProfile={workspace.profile}
+                  userTransactions={ledgerTransactions.filter(
+                    (t) => t.userEmail.toLowerCase() === workspace.profile.email.toLowerCase()
+                  )}
+                  tickets={supportTickets.filter(
+                    (t) => t.userEmail.toLowerCase() === workspace.profile.email.toLowerCase()
+                  )}
+                  onSubmitTicket={handleSubmitSupportTicket}
+                />
               </Suspense>
             </ErrorBoundary>
           )}
@@ -1815,6 +2229,7 @@ export default function App() {
                   onUpdateProfile={handleUpdateProfile}
                   onCheckoutPlan={handleCheckoutPlan}
                   onOpenAffiliatePortal={() => handleNavigateView('affiliate')}
+                  onOpenSupport={() => handleNavigateView('support')}
                   onSignOut={() => void handleSignOut()}
                 />
               </Suspense>
@@ -1825,12 +2240,14 @@ export default function App() {
             <ErrorBoundary fallbackTitle="Admin Command Center Error">
               <Suspense fallback={<ViewLoadingFallback />}>
                 <AdminDashboardView
+                  adminEmail={workspace.profile.email}
                   users={registeredUsers}
                   promoCodes={promoCodes}
                   affiliates={affiliates}
                   customIntegrations={customIntegrations}
                   paymentSettings={paymentSettings}
                   ledgerTransactions={ledgerTransactions}
+                  supportTickets={supportTickets}
                   onChangeUserTier={handleChangeUserTier}
                   onToggleUserStatus={handleToggleUserStatus}
                   onTriggerPasswordReset={handleTriggerPasswordReset}
@@ -1842,6 +2259,8 @@ export default function App() {
                   onUpdateCustomIntegrationStatus={handleUpdateCustomIntegrationStatus}
                   onDeleteCustomIntegration={handleDeleteCustomIntegration}
                   onSavePaymentSettings={handleSavePaymentSettings}
+                  onUpdateSupportTicket={handleUpdateSupportTicket}
+                  onIssueRefund={handleIssueRefund}
                 />
               </Suspense>
             </ErrorBoundary>
@@ -1898,11 +2317,24 @@ export default function App() {
             promoCodes={promoCodes}
             onUpdateProfile={handleUpdateProfile}
             onCheckoutPlan={handleCheckoutPlan}
+            onOpenSupport={() => handleNavigateView('support')}
             onSignOut={() => void handleSignOut()}
             onClose={() => setShowAccountModal(false)}
           />
         )}
       </div>
+  );
+
+  return HAS_GOOGLE_MAPS_KEY ? (
+    <APIProvider
+      apiKey={GOOGLE_MAPS_API_KEY}
+      language="en"
+      region="US"
+      libraries={['places', 'marker', 'streetView', 'geocoding']}
+    >
+      {appShell}
     </APIProvider>
+  ) : (
+    appShell
   );
 }

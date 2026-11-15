@@ -10,6 +10,26 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { resolveZipSync } from './src/utils/zipLookup.ts';
 import { buildProb8Modelfile, selectOptimalOllamaModel } from './src/utils/ollamaHardware.ts';
 import { isSafeExternalWebhookUrl } from './src/utils/webhookSecurity.ts';
+import { EnterpriseLruTtlCache } from './src/utils/enterpriseCache.ts';
+import {
+  checkScheduledCourthouseSlot,
+  createInitialCourthouseState,
+  executeCourthouseSyncCycle,
+} from './src/utils/courthouseSync.ts';
+import {
+  detectLemonSqueezyMode,
+  filterAndSortSupportTickets,
+  normalizeLemonSqueezyOrders,
+  normalizeLemonSqueezyStores,
+  normalizeLemonSqueezySubscriptions,
+  validateSupportTicketInput,
+} from './src/utils/supportAndRefunds.ts';
+import type {
+  LemonSqueezyOverviewResponse,
+  SubscriptionTier,
+  SupportTicket,
+  SupportTicketStatus,
+} from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +37,8 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const BASE_NATIONWIDE_ACTIVE = 142850;
 const VAPID_STORE_PATH = path.resolve(__dirname, '.prob8-vapid.json');
+const SUPPORT_STORE_PATH = path.resolve(__dirname, '.prob8-support-tickets.json');
+const FOUNDER_ADMIN_EMAIL = 'busapower07@gmail.com';
 
 interface VapidKeyPairStore {
   publicKey: string;
@@ -98,8 +120,13 @@ function createSlidingRateLimiter(maxRequests: number, windowMs: number, maxBuck
   };
 }
 
-const searchRateLimiter = createSlidingRateLimiter(120, 60_000);
-const skipTraceRateLimiter = createSlidingRateLimiter(60, 60_000);
+const searchRateLimiter = createSlidingRateLimiter(240, 60_000, 10000);
+const skipTraceRateLimiter = createSlidingRateLimiter(90, 60_000, 10000);
+const aiRateLimiter = createSlidingRateLimiter(90, 60_000, 10000);
+const checkoutRateLimiter = createSlidingRateLimiter(60, 60_000, 10000);
+
+const searchResponseCache = new EnterpriseLruTtlCache<Record<string, unknown>>(2500, 60_000);
+const geocodeResponseCache = new EnterpriseLruTtlCache<GeoCenter>(2500, 300_000);
 
 const PHOTO_ASSETS = {
   craftsman: '/src/assets/images/prop_craftsman_ext_1794630630705.jpg',
@@ -187,76 +214,71 @@ const US_MARKET_ANCHORS: Array<GeoCenter & { keywords: string[] }> = [
   { city: 'Cheyenne', state: 'WY', county: 'Laramie County', zip: '82001', lat: 41.14, lng: -104.8202, countyActiveCount: 74, keywords: ['cheyenne', 'wyoming', 'wy', '820'] },
 ];
 
-interface SyncTelemetryState {
-  initialHydratedAt: string;
-  lastSyncedAt: string;
-  lastSlot: string;
-  statesCovered: number;
-  countiesScanned: number;
-  totalNationwideActive: number;
-  newFilingsIngested: number;
-  soldPropertiesPurged: number;
-  auctionsUpdated: number;
-  nextScheduledWindow: string;
-  purgedCaseIds: Set<string>;
-  autoRunsCompleted: number;
-}
+const syncState = createInitialCourthouseState(BASE_NATIONWIDE_ACTIVE);
 
-function computeNextWeekdaySyncLabel(now = new Date()): string {
-  const etParts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short',
-    hour: 'numeric',
-    minute: 'numeric',
-    hour12: false,
-  }).formatToParts(now);
-  const weekday = etParts.find((p) => p.type === 'weekday')?.value ?? 'Mon';
-  const hour = Number(etParts.find((p) => p.type === 'hour')?.value ?? '9');
-  const isWeekend = weekday === 'Sat' || weekday === 'Sun';
-  if (!isWeekend && hour < 11) return 'Today 11:00 AM ET (Mon–Fri Schedule)';
-  if (!isWeekend && hour < 16) return 'Today 4:00 PM ET (Mon–Fri Schedule)';
-  return 'Next Business Day 11:00 AM ET (Mon–Fri Schedule)';
-}
+async function runCourthouseSyncAndPurge(slotLabel: string) {
+  let liveAdded: number | undefined;
+  let liveUpdated: number | undefined;
+  let livePurgedCases: string[] | undefined;
+  let sourceMode: 'live_courthouse_feed' | 'hybrid_assessor_engine' = 'hybrid_assessor_engine';
 
-const syncState: SyncTelemetryState = {
-  initialHydratedAt: new Date().toISOString(),
-  lastSyncedAt: new Date().toISOString(),
-  lastSlot: 'Initial 50-State + DC Startup Hydration',
-  statesCovered: 51,
-  countiesScanned: 3143,
-  totalNationwideActive: BASE_NATIONWIDE_ACTIVE,
-  newFilingsIngested: 102,
-  soldPropertiesPurged: 24,
-  auctionsUpdated: 18,
-  nextScheduledWindow: computeNextWeekdaySyncLabel(),
-  purgedCaseIds: new Set<string>(['2025-PR-1091', '2025-PR-1882']),
-  autoRunsCompleted: 1,
-};
+  const feedUrl = process.env.PROBATE_DATA_API_URL?.trim();
+  if (feedUrl && isSafeExternalWebhookUrl(feedUrl).safe) {
+    try {
+      const headers: Record<string, string> = { Accept: 'application/json' };
+      if (process.env.PROBATE_DATA_API_KEY?.trim()) {
+        headers.Authorization = `Bearer ${process.env.PROBATE_DATA_API_KEY.trim()}`;
+      }
+      const resp = await fetch(feedUrl, { headers, signal: AbortSignal.timeout(4000) });
+      if (resp.ok) {
+        const data = (await resp.json()) as {
+          newCount?: number;
+          updatedCount?: number;
+          purgedCases?: string[];
+        };
+        sourceMode = 'live_courthouse_feed';
+        if (typeof data.newCount === 'number') liveAdded = data.newCount;
+        if (typeof data.updatedCount === 'number') liveUpdated = data.updatedCount;
+        if (Array.isArray(data.purgedCases)) livePurgedCases = data.purgedCases.map(String);
+      }
+    } catch {
+      // Fall back cleanly to deterministic nationwide courthouse & assessor cycle
+    }
+  }
 
-function runCourthouseSyncAndPurge(slotLabel: string) {
-  const purgedCount = 14 + (syncState.autoRunsCompleted % 9);
-  const addedCount = 38 + (syncState.autoRunsCompleted % 17);
-  const auctionsUpdated = 12 + (syncState.autoRunsCompleted % 7);
-  syncState.lastSyncedAt = new Date().toISOString();
-  syncState.lastSlot = slotLabel;
-  syncState.newFilingsIngested = addedCount;
-  syncState.soldPropertiesPurged = purgedCount;
-  syncState.auctionsUpdated = auctionsUpdated;
-  syncState.totalNationwideActive = Math.max(140000, syncState.totalNationwideActive - purgedCount + addedCount);
-  syncState.nextScheduledWindow = computeNextWeekdaySyncLabel();
-  syncState.autoRunsCompleted += 1;
+  const anchor = US_MARKET_ANCHORS[syncState.autoRunsCompleted % US_MARKET_ANCHORS.length];
+  const runNum = syncState.autoRunsCompleted + 1;
+  const newExtraSeeds = [
+    {
+      state: anchor.state,
+      county: anchor.county,
+      city: anchor.city,
+      zip: anchor.zip,
+      lat: Number((anchor.lat + 0.008).toFixed(5)),
+      lng: Number((anchor.lng - 0.009).toFixed(5)),
+      street: `${2200 + runNum * 19} Courthouse Crest Dr`,
+      caseNumber: `2026-PR-${9000 + runNum}`,
+      addedAt: new Date().toISOString().slice(0, 10),
+    },
+  ];
+
+  const runRecord = executeCourthouseSyncCycle(syncState, slotLabel, {
+    sourceMode,
+    liveAdded,
+    liveUpdated,
+    livePurgedCases,
+    newExtraSeeds,
+  });
+
+  // Invalidate cached search payloads so Discover immediately shows added, updated & purged parcels
+  searchResponseCache.clear();
+
   return {
     ok: true,
-    slot: syncState.lastSlot,
-    statesCovered: syncState.statesCovered,
-    countiesScanned: syncState.countiesScanned,
-    newFilingsIngested: addedCount,
-    soldPropertiesPurged: purgedCount,
-    auctionsUpdated,
-    totalNationwideActive: syncState.totalNationwideActive,
+    ...runRecord,
     initialHydratedAt: syncState.initialHydratedAt,
     nextScheduledWindow: syncState.nextScheduledWindow,
-    ranAt: syncState.lastSyncedAt,
+    syncHistory: syncState.syncHistory,
   };
 }
 
@@ -266,29 +288,10 @@ function ensureWeekdaySyncScheduler() {
   schedulerStarted = true;
   let lastTriggerKey = '';
   const timer = setInterval(() => {
-    const now = new Date();
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'America/New_York',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      weekday: 'short',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).formatToParts(now);
-    const weekday = parts.find((p) => p.type === 'weekday')?.value ?? '';
-    const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '-1');
-    const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '-1');
-    const dateKey = `${parts.find((p) => p.type === 'year')?.value}-${parts.find((p) => p.type === 'month')?.value}-${parts.find((p) => p.type === 'day')?.value}`;
-    const isWeekday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(weekday);
-    if (!isWeekday) return;
-    if (hour === 11 && minute === 0 && lastTriggerKey !== `${dateKey}-11`) {
-      lastTriggerKey = `${dateKey}-11`;
-      runCourthouseSyncAndPurge('Automated Mon–Fri 11:00 AM Courthouse Sync & Purge');
-    } else if (hour === 16 && minute === 0 && lastTriggerKey !== `${dateKey}-16`) {
-      lastTriggerKey = `${dateKey}-16`;
-      runCourthouseSyncAndPurge('Automated Mon–Fri 4:00 PM Courthouse Sync & Purge');
+    const check = checkScheduledCourthouseSlot(new Date(), lastTriggerKey);
+    if (check.triggered && check.slotLabel) {
+      lastTriggerKey = check.triggerKey;
+      void runCourthouseSyncAndPurge(check.slotLabel);
     }
   }, 30000);
   timer.unref?.();
@@ -403,46 +406,97 @@ function buildNationalProbateFallback(center: GeoCenter, isNationalBrowse: boole
   ] as const;
 
   const seeds = isNationalBrowse
-    ? US_MARKET_ANCHORS.flatMap((anchor, aIdx) => [
-        {
-          ...anchor,
-          street: streetPool[aIdx % streetPool.length],
-          type: typesPool[aIdx % typesPool.length],
-          avm: 345000 + (aIdx % 7) * 65000,
-          mortgage: 38000 + (aIdx % 5) * 24000,
-          probatePrice: Math.round((345000 + (aIdx % 7) * 65000) * 0.74),
-          beds: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 12 : 3 + (aIdx % 3),
-          baths: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 12 : 2 + (aIdx % 2) * 0.5,
-          sqft: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 8800 : 1650 + (aIdx % 6) * 220,
-          year: 1924 + (aIdx % 8) * 7,
-          daysAgo: [7, 29, 108, 34, 10, 96, 26, 11][aIdx % 8],
-          status: (aIdx % 5 === 1 ? 'auction' : 'active') as 'active' | 'auction',
-          mediaMode: (['zillow_full', 'redfin_fallback', 'streetview_only'] as const)[aIdx % 3],
-          taxDelinq: aIdx % 3 === 1,
-          vacant: aIdx % 2 === 0,
-          preFc: aIdx % 4 === 2,
-          exactCoords: aIdx === 0,
-        },
-        {
-          ...anchor,
-          street: `${1100 + aIdx * 83} Oakridge Pkwy`,
-          type: typesPool[(aIdx + 2) % typesPool.length],
-          avm: 390000 + (aIdx % 6) * 55000,
-          mortgage: 49000 + (aIdx % 4) * 19000,
-          probatePrice: Math.round((390000 + (aIdx % 6) * 55000) * 0.73),
-          beds: 3 + (aIdx % 2),
+    ? [
+        ...syncState.ingestedExtraSeeds.map((extra, eIdx) => ({
+          city: extra.city,
+          state: extra.state,
+          county: extra.county,
+          zip: extra.zip,
+          lat: extra.lat,
+          lng: extra.lng,
+          countyActiveCount: 240,
+          keywords: [extra.city.toLowerCase(), extra.state.toLowerCase()],
+          street: extra.street,
+          type: typesPool[eIdx % typesPool.length],
+          avm: 365000 + (eIdx % 5) * 45000,
+          mortgage: 32000 + (eIdx % 4) * 18000,
+          probatePrice: Math.round((365000 + (eIdx % 5) * 45000) * 0.72),
+          beds: 3 + (eIdx % 2),
           baths: 2,
-          sqft: 1840 + (aIdx % 5) * 180,
-          year: 1945 + (aIdx % 6) * 6,
-          daysAgo: [12, 38, 114, 9, 25, 102][aIdx % 6],
-          status: (aIdx % 4 === 3 ? 'auction' : 'active') as 'active' | 'auction',
-          mediaMode: (['redfin_fallback', 'zillow_full', 'streetview_only'] as const)[aIdx % 3],
-          taxDelinq: aIdx % 4 === 0,
-          vacant: aIdx % 3 !== 0,
-          preFc: aIdx % 5 === 0,
-          exactCoords: false,
-        },
-      ])
+          sqft: 1780 + (eIdx % 4) * 160,
+          year: 1958 + (eIdx % 6) * 5,
+          daysAgo: 2 + (eIdx % 7),
+          status: (eIdx % 3 === 0 ? 'auction' : 'active') as 'active' | 'auction',
+          mediaMode: (['zillow_full', 'redfin_fallback', 'streetview_only'] as const)[eIdx % 3],
+          taxDelinq: eIdx % 2 === 0,
+          vacant: true,
+          preFc: eIdx % 3 === 1,
+          exactCoords: true,
+          overrideCaseNumber: extra.caseNumber,
+        })),
+        ...US_MARKET_ANCHORS.flatMap((anchor, aIdx) => [
+          {
+            ...anchor,
+            street: streetPool[aIdx % streetPool.length],
+            type: typesPool[aIdx % typesPool.length],
+            avm: 345000 + (aIdx % 7) * 65000,
+            mortgage: 38000 + (aIdx % 5) * 24000,
+            probatePrice: Math.round((345000 + (aIdx % 7) * 65000) * 0.74),
+            beds: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 12 : 3 + (aIdx % 3),
+            baths: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 12 : 2 + (aIdx % 2) * 0.5,
+            sqft: typesPool[aIdx % typesPool.length] === 'Mobile Home / Trailer Park' ? 8800 : 1650 + (aIdx % 6) * 220,
+            year: 1924 + (aIdx % 8) * 7,
+            daysAgo: [7, 29, 108, 34, 10, 96, 26, 11][aIdx % 8],
+            status: (aIdx % 5 === 1 ? 'auction' : 'active') as 'active' | 'auction',
+            mediaMode: (['zillow_full', 'redfin_fallback', 'streetview_only'] as const)[aIdx % 3],
+            taxDelinq: aIdx % 3 === 1,
+            vacant: aIdx % 2 === 0,
+            preFc: aIdx % 4 === 2,
+            exactCoords: aIdx === 0,
+            overrideCaseNumber: undefined as string | undefined,
+          },
+          {
+            ...anchor,
+            street: `${1100 + aIdx * 83} Oakridge Pkwy`,
+            type: typesPool[(aIdx + 2) % typesPool.length],
+            avm: 390000 + (aIdx % 6) * 55000,
+            mortgage: 49000 + (aIdx % 4) * 19000,
+            probatePrice: Math.round((390000 + (aIdx % 6) * 55000) * 0.73),
+            beds: 3 + (aIdx % 2),
+            baths: 2,
+            sqft: 1840 + (aIdx % 5) * 180,
+            year: 1945 + (aIdx % 6) * 6,
+            daysAgo: [12, 38, 114, 9, 25, 102][aIdx % 6],
+            status: (aIdx % 4 === 3 ? 'auction' : 'active') as 'active' | 'auction',
+            mediaMode: (['redfin_fallback', 'zillow_full', 'streetview_only'] as const)[aIdx % 3],
+            taxDelinq: aIdx % 4 === 0,
+            vacant: aIdx % 3 !== 0,
+            preFc: aIdx % 5 === 0,
+            exactCoords: false,
+            overrideCaseNumber: undefined as string | undefined,
+          },
+          {
+            ...anchor,
+            street: `${640 + aIdx * 47} Heritage Ln`,
+            type: typesPool[(aIdx + 4) % typesPool.length],
+            avm: 415000 + (aIdx % 5) * 48000,
+            mortgage: 52000 + (aIdx % 3) * 21000,
+            probatePrice: Math.round((415000 + (aIdx % 5) * 48000) * 0.71),
+            beds: 4,
+            baths: 2.5,
+            sqft: 2050 + (aIdx % 5) * 190,
+            year: 1962 + (aIdx % 7) * 4,
+            daysAgo: [16, 44, 93, 6, 33, 121][aIdx % 6],
+            status: (aIdx % 6 === 2 ? 'auction' : 'active') as 'active' | 'auction',
+            mediaMode: (['streetview_only', 'zillow_full', 'redfin_fallback'] as const)[aIdx % 3],
+            taxDelinq: aIdx % 5 === 2,
+            vacant: aIdx % 2 === 1,
+            preFc: aIdx % 3 === 0,
+            exactCoords: false,
+            overrideCaseNumber: undefined as string | undefined,
+          },
+        ]),
+      ]
     : Array.from({ length: 18 }, (_, i) => {
         const avm = 310000 + (i % 7) * 52000;
         const propType = typesPool[i % typesPool.length];
@@ -467,6 +521,7 @@ function buildNationalProbateFallback(center: GeoCenter, isNationalBrowse: boole
           vacant: i % 2 === 0,
           preFc: i % 4 === 2,
           exactCoords: i === 0 && center.city.toLowerCase() === 'columbus',
+          overrideCaseNumber: undefined as string | undefined,
         };
       });
 
@@ -512,8 +567,10 @@ function buildNationalProbateFallback(center: GeoCenter, isNationalBrowse: boole
     const deathDate = daysAgoIso(s.daysAgo + 28);
     const hearingDate = new Date(Date.now() + (14 + (idx % 21)) * 86400000).toISOString().slice(0, 10);
     const apn = `${String(102 + idx * 17)}-${String(4400 + idx * 319)}-${String(10 + idx)}`;
+    const caseNumber = s.overrideCaseNumber || `2026-PR-${String(4102 + idx * 137)}`;
+    const milestone = syncState.updatedCaseMilestones.get(caseNumber);
     const openingBid = Math.round(s.probatePrice * 0.78);
-    const currentBid = openingBid + (idx % 3) * 7500;
+    const currentBid = openingBid + (idx % 3) * 7500 + (milestone?.bidBumpUsd ?? 0);
     const pricePerSqft = Math.round(s.avm / Math.max(1, s.sqft));
     const rentEst = Math.round(s.avm * 0.0074);
 
@@ -534,12 +591,14 @@ function buildNationalProbateFallback(center: GeoCenter, isNationalBrowse: boole
       sqft: s.sqft,
       lotSqft: 6400 + (idx % 8) * 850,
       yearBuilt: s.year,
-      probateCaseNumber: `2026-PR-${String(4102 + idx * 137)}`,
+      probateCaseNumber: caseNumber,
       filingDate,
       hearingDate,
       probatePrice: s.probatePrice,
       courtName: `${s.county} Probate Court`,
-      courtDivision: 'Probate & Estate Administration Division',
+      courtDivision: milestone
+        ? `Probate Division · ${milestone.docketStage}`
+        : 'Probate & Estate Administration Division',
       judgeName: d.judge,
       bondAmount: s.avm > 500000 ? 25000 : 10000,
       estateInventoryValue: Math.round(s.avm * 1.08),
@@ -669,7 +728,7 @@ function buildNationalProbateFallback(center: GeoCenter, isNationalBrowse: boole
             }
           : undefined,
       isWatchedAuction: false,
-      lastSyncedAt: new Date().toISOString(),
+      lastSyncedAt: milestone?.updatedAt || syncState.lastSyncedAt,
     };
   });
 }
@@ -687,7 +746,16 @@ export function createProb8App(): Express {
   ensureWeekdaySyncScheduler();
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, service: 'prob8-api', version: '2.2.0', statesCovered: syncState.statesCovered });
+    res.json({
+      ok: true,
+      service: 'prob8-api',
+      version: '2.3.0',
+      statesCovered: syncState.statesCovered,
+      countiesScanned: syncState.countiesScanned,
+      totalNationwideActive: syncState.totalNationwideActive,
+      cache: searchResponseCache.getStats(),
+      uptimeSeconds: Math.round(process.uptime()),
+    });
   });
 
   // Auto-generated Web Push Public Key (never exposes private signing key)
@@ -721,7 +789,11 @@ export function createProb8App(): Express {
     const query = String(req.query.q || '').trim();
     const lat = req.query.lat ? Number(req.query.lat) : undefined;
     const lng = req.query.lng ? Number(req.query.lng) : undefined;
-    const resolved = await resolveUsLocation(query || undefined, lat, lng);
+    const cacheKey = `${query.toLowerCase()}|${lat ?? ''}|${lng ?? ''}`;
+    const resolved = await geocodeResponseCache.getOrCompute(cacheKey, () =>
+      resolveUsLocation(query || undefined, lat, lng)
+    );
+    res.setHeader('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=900');
     res.json(resolved);
   });
 
@@ -800,7 +872,7 @@ export function createProb8App(): Express {
 
   app.post('/api/probate/search', searchRateLimiter, async (req: Request, res: Response) => {
     try {
-      const { query, lat, lng, cursor = 0, limit = 120 } = req.body as {
+      const { query, lat, lng, cursor = 0, limit = 200 } = req.body as {
         query?: string;
         lat?: number;
         lng?: number;
@@ -808,173 +880,29 @@ export function createProb8App(): Express {
         limit?: number;
       };
       const safeCursor = Math.max(0, Number(cursor) || 0);
-      const safeLimit = Math.max(1, Math.min(200, Number(limit) || 120));
+      const safeLimit = Math.max(1, Math.min(250, Number(limit) || 200));
       const isNationalBrowse = !query?.trim() && lat === undefined && lng === undefined;
-      const center = await resolveUsLocation(query, lat, lng);
+      const cacheKey = JSON.stringify({
+        q: (query || '').trim().toLowerCase(),
+        lat: lat !== undefined ? Number(lat.toFixed(3)) : null,
+        lng: lng !== undefined ? Number(lng.toFixed(3)) : null,
+        cursor: safeCursor,
+        limit: safeLimit,
+        syncVersion: syncState.autoRunsCompleted,
+      });
 
-      const ai = getGeminiClient();
-      if (ai && !isNationalBrowse) {
-        try {
-          const geminiPromise = ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: `Generate 8 realistic US probate real estate property records located in ${center.city}, ${center.county}, ${center.state} ${center.zip} near lat ${center.lat}, lng ${center.lng}. Include varied filing dates across recent (<14 days), 21-45 days, and 90+ days, plus 2 active county probate/sheriff auctions. Use authentic local street names, realistic local home prices, probate estate asking prices, realistic APNs, and realistic local probate court names. Return JSON array.`,
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    street: { type: Type.STRING },
-                    zip: { type: Type.STRING },
-                    latOffset: { type: Type.NUMBER },
-                    lngOffset: { type: Type.NUMBER },
-                    propertyType: { type: Type.STRING },
-                    beds: { type: Type.INTEGER },
-                    baths: { type: Type.NUMBER },
-                    sqft: { type: Type.INTEGER },
-                    yearBuilt: { type: Type.INTEGER },
-                    avmValue: { type: Type.NUMBER },
-                    probatePrice: { type: Type.NUMBER },
-                    mortgageBalance: { type: Type.NUMBER },
-                    apn: { type: Type.STRING },
-                    caseNumber: { type: Type.STRING },
-                    daysAgo: { type: Type.INTEGER },
-                    isAuction: { type: Type.BOOLEAN },
-                    decedentName: { type: Type.STRING },
-                    executorName: { type: Type.STRING },
-                    attorneyName: { type: Type.STRING },
-                    taxDelinquent: { type: Type.BOOLEAN },
-                    isVacant: { type: Type.BOOLEAN },
-                    preForeclosureOverlap: { type: Type.BOOLEAN },
-                  },
-                },
-              },
-            },
-          });
+      const payload = await searchResponseCache.getOrCompute(cacheKey, async () => {
+        const center = await geocodeResponseCache.getOrCompute(
+          `${(query || '').trim().toLowerCase()}|${lat ?? ''}|${lng ?? ''}`,
+          () => resolveUsLocation(query, lat, lng)
+        );
 
-          const response = await Promise.race([
-            geminiPromise,
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('Search enrichment timeout')), 4000)
-            ),
-          ]);
-
-          const parsed = JSON.parse((response.text ?? '[]').trim()) as Array<Record<string, unknown>>;
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const fallbackBase = buildNationalProbateFallback(center, false);
-            const allowedTypes = [
-              'Single-Family',
-              'Multi-Family',
-              'Short-Term Rental',
-              'Condo/Townhouse',
-              'Mobile Home / Trailer Park',
-              'Land',
-              'Commercial',
-            ];
-            const merged = parsed.slice(0, 8).map((item, idx) => {
-              const base = fallbackBase[idx % fallbackBase.length];
-              const avm = Number(item.avmValue) || base.avmValue;
-              const probatePrice = Number(item.probatePrice) || Math.round(avm * 0.74);
-              const mortgage = Math.max(0, Math.min(avm * 0.65, Number(item.mortgageBalance) || base.mortgageBalance));
-              const equity = Math.max(0, Math.round(avm - mortgage));
-              const equityPct = Number(((equity / avm) * 100).toFixed(1));
-              const assessed = Math.round(avm * 0.72);
-              const taxes = Math.round(assessed * 0.016);
-              const propType = allowedTypes.includes(String(item.propertyType))
-                ? (String(item.propertyType) as typeof base.propertyType)
-                : base.propertyType;
-              const daysAgo = Math.max(2, Math.min(180, Number(item.daysAgo) || 12 + idx * 14));
-              const status = Boolean(item.isAuction) ? ('auction' as const) : ('active' as const);
-
-              return {
-                ...base,
-                id: `prop-${center.state.toLowerCase()}-${Date.now().toString(36)}-${idx}`,
-                apn: String(item.apn || base.apn),
-                address: String(item.street || base.address),
-                city: center.city,
-                state: center.state,
-                county: center.county,
-                zip: String(item.zip || center.zip),
-                lat: Number((center.lat + (Number(item.latOffset) || (idx - 3) * 0.007)).toFixed(5)),
-                lng: Number((center.lng + (Number(item.lngOffset) || (idx % 2 === 0 ? 0.01 : -0.01))).toFixed(5)),
-                status,
-                propertyType: propType,
-                beds: Number(item.beds) || base.beds,
-                baths: Number(item.baths) || base.baths,
-                sqft: Number(item.sqft) || base.sqft,
-                yearBuilt: Number(item.yearBuilt) || base.yearBuilt,
-                probateCaseNumber: String(item.caseNumber || base.probateCaseNumber),
-                filingDate: daysAgoIso(daysAgo),
-                probatePrice,
-                decedentName: String(item.decedentName || base.decedentName),
-                executorName: String(item.executorName || base.executorName),
-                probateAttorney: String(item.attorneyName || base.probateAttorney),
-                avmValue: avm,
-                mortgageBalance: Math.round(mortgage),
-                estimatedEquity: equity,
-                equityPct,
-                taxDelinquent: Boolean(item.taxDelinquent),
-                isVacant: Boolean(item.isVacant),
-                preForeclosureOverlap: Boolean(item.preForeclosureOverlap),
-                auctionData:
-                  status === 'auction'
-                    ? {
-                        auctionType: 'Sheriff Sale' as const,
-                        auctionPortalName: `${center.county} Online Auction Portal`,
-                        startsAt: new Date(Date.now() - 3600000).toISOString(),
-                        endsAt: new Date(Date.now() + (idx + 3) * 3600000).toISOString(),
-                        openingBid: Math.round(probatePrice * 0.78),
-                        currentBid: Math.round(probatePrice * 0.82),
-                        bidIncrement: 2500,
-                        depositRequired: 5000,
-                        reserveMet: true,
-                        bidCount: 5 + idx,
-                        registrationOpen: true,
-                        isRegistered: false,
-                        rulesSummary: `${center.county} requires $5,000 earnest deposit prior to live bid confirmation.`,
-                        lastPolledAt: new Date().toISOString(),
-                      }
-                    : undefined,
-                assessorData: {
-                  ...base.assessorData,
-                  assessedValue: assessed,
-                  landValue: Math.round(assessed * 0.28),
-                  improvementValue: Math.round(assessed * 0.72),
-                  annualTaxes: taxes,
-                },
-              };
-            });
-
-            res.json({
-              center,
-              isNationalBrowse,
-              totalActiveInQuery: center.countyActiveCount,
-              totalNationwideActive: syncState.totalNationwideActive,
-              syncSummary: {
-                lastSyncedAt: syncState.lastSyncedAt,
-                lastSlot: syncState.lastSlot,
-                statesCovered: syncState.statesCovered,
-                nextScheduledWindow: syncState.nextScheduledWindow,
-              },
-              properties: merged.filter((p) => !syncState.purgedCaseIds.has(p.probateCaseNumber)),
-              nextCursor: null,
-              hasMore: false,
-            });
-            return;
-          }
-        } catch (aiErr) {
-          console.warn('Gemini search enrichment fallback:', (aiErr as Error).message);
-        }
-      }
-
-      const allProps = buildNationalProbateFallback(center, isNationalBrowse).filter(
+        const allProps = buildNationalProbateFallback(center, isNationalBrowse).filter(
         (p) => !syncState.purgedCaseIds.has(p.probateCaseNumber)
       );
       const pagedProps = allProps.slice(safeCursor, safeCursor + safeLimit);
       const nextCursor = safeCursor + pagedProps.length < allProps.length ? safeCursor + pagedProps.length : null;
-      res.json({
+      return {
         center,
         isNationalBrowse,
         totalActiveInQuery: isNationalBrowse ? syncState.totalNationwideActive : center.countyActiveCount,
@@ -988,13 +916,16 @@ export function createProb8App(): Express {
         properties: pagedProps,
         nextCursor,
         hasMore: nextCursor !== null,
+      };
       });
+      res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+      res.json(payload);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/ai/underwrite', async (req: Request, res: Response) => {
+  app.post('/api/ai/underwrite', aiRateLimiter, async (req: Request, res: Response) => {
     const { property, strategy, mao70Rule, totalRehab, monthlyCashFlow, flipNetProfit, dscr } = req.body as {
       property: Record<string, unknown>;
       strategy?: string;
@@ -1026,7 +957,7 @@ export function createProb8App(): Express {
     }
   });
 
-  app.post('/api/ai/scripts', async (req: Request, res: Response) => {
+  app.post('/api/ai/scripts', aiRateLimiter, async (req: Request, res: Response) => {
     const { property, tone } = req.body as { property: Record<string, unknown>; tone?: string };
     const deterministicScripts = {
       coldCallScript: `Hi ${property.executorName}, this is [Your Name] calling locally in ${property.city}. I know settling the ${property.decedentName} estate takes coordination, and I'm reaching out respectfully to see if you'd consider a straightforward as-is cash offer on ${property.address} with zero cleanout or agent commissions. Would a flexible closing timeline around the ${property.county} court schedule help take something off your plate?`,
@@ -1068,7 +999,7 @@ export function createProb8App(): Express {
     }
   });
 
-  app.post('/api/ai/document', async (req: Request, res: Response) => {
+  app.post('/api/ai/document', aiRateLimiter, async (req: Request, res: Response) => {
     const { property, docType, offerPrice, closingDays } = req.body as {
       property: Record<string, unknown>;
       docType: 'loi' | 'purchase_contract';
@@ -1207,7 +1138,21 @@ export function createProb8App(): Express {
         configured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY.includes('your-supabase')),
         isFree: true,
         autoConfiguredOnVercel: true,
-        purpose: 'Server-only admin key for automated M-F 11 AM & 4 PM courthouse syncs & user overrides.',
+        purpose: 'Server-only admin key for automated M-F 11 AM & 3 PM ET courthouse syncs & user overrides.',
+      },
+      {
+        name: 'LEMONSQUEEZY_API_KEY',
+        configured: Boolean(process.env.LEMONSQUEEZY_API_KEY?.trim()),
+        isFree: true,
+        autoConfiguredOnVercel: false,
+        purpose: 'Server-only Lemon Squeezy API key powering Admin Dashboard orders, subscriptions & 1-click refunds.',
+      },
+      {
+        name: 'LEMONSQUEEZY_WEBHOOK_SECRET',
+        configured: Boolean(process.env.LEMONSQUEEZY_WEBHOOK_SECRET),
+        isFree: true,
+        autoConfiguredOnVercel: false,
+        purpose: 'HMAC-SHA256 signature verification for Lemon Squeezy live subscription & affiliate webhooks.',
       },
       {
         name: 'VITE_GOOGLE_MAPS_API_KEY',
@@ -1275,7 +1220,7 @@ export function createProb8App(): Express {
   });
 
   // Multi-Processor Payment Checkout Endpoint (Lemon Squeezy, Paddle, Square, Authorize.Net, PayPal)
-  app.post('/api/checkout/process', (req: Request, res: Response) => {
+  app.post('/api/checkout/process', checkoutRateLimiter, (req: Request, res: Response) => {
     const {
       processor = 'lemonsqueezy',
       plan = 'pro',
@@ -1283,6 +1228,7 @@ export function createProb8App(): Express {
       grossUsd = 79,
       isTrial = false,
       promoCode,
+      affiliateCode,
     } = (req.body || {}) as {
       processor?: string;
       plan?: string;
@@ -1290,6 +1236,7 @@ export function createProb8App(): Express {
       grossUsd?: number;
       isTrial?: boolean;
       promoCode?: string;
+      affiliateCode?: string;
     };
     if (!userEmail || typeof userEmail !== 'string' || !userEmail.includes('@')) {
       res.status(400).json({ ok: false, error: 'A valid user email is required for checkout.' });
@@ -1306,6 +1253,26 @@ export function createProb8App(): Express {
     }
     const allowed = ['lemonsqueezy', 'paddle', 'square', 'authorizenet', 'paypal'];
     const safeProcessor = allowed.includes(processor) ? processor : 'lemonsqueezy';
+
+    let checkoutUrl: string | undefined;
+    if (safeProcessor === 'lemonsqueezy') {
+      const configuredBase =
+        plan === 'vip_lifetime'
+          ? process.env.LEMONSQUEEZY_LIFETIME_CHECKOUT_URL?.trim()
+          : process.env.LEMONSQUEEZY_PRO_CHECKOUT_URL?.trim();
+      if (configuredBase && configuredBase.startsWith('https://')) {
+        const url = new URL(configuredBase);
+        url.searchParams.set('checkout[email]', userEmail.trim());
+        if (promoCode?.trim()) {
+          url.searchParams.set('checkout[discount_code]', promoCode.trim().toUpperCase());
+        }
+        if (affiliateCode?.trim()) {
+          url.searchParams.set('aff', affiliateCode.trim());
+        }
+        checkoutUrl = url.toString();
+      }
+    }
+
     res.json({
       ok: true,
       transactionId: `TXN-${safeProcessor.toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
@@ -1313,10 +1280,70 @@ export function createProb8App(): Express {
       plan,
       userEmail: userEmail.trim(),
       promoCode: promoCode ? String(promoCode).trim().toUpperCase() : undefined,
+      affiliateCode: affiliateCode ? String(affiliateCode).trim() : undefined,
+      checkoutUrl,
       grossUsd: isTrial ? 0 : Number(numericGross.toFixed(2)),
       status: isTrial ? 'trial' : 'paid',
       processedAt: new Date().toISOString(),
     });
+  });
+
+  // Lemon Squeezy HMAC-SHA256 Webhook Receiver
+  app.post('/api/webhooks/lemonsqueezy', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
+    const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET?.trim();
+    const signature = String(req.headers['x-signature'] || '');
+    const rawPayload = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body || {});
+
+    if (secret) {
+      const expected = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+      const sigBuf = Buffer.from(signature, 'utf8');
+      const expBuf = Buffer.from(expected, 'utf8');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        res.status(401).json({ ok: false, error: 'Invalid Lemon Squeezy webhook signature.' });
+        return;
+      }
+    }
+
+    let parsed: {
+      meta?: { event_name?: string; custom_data?: { user_id?: string; plan?: string } };
+      data?: { attributes?: { user_email?: string; variant_name?: string } };
+    } = {};
+    try {
+      parsed = JSON.parse(rawPayload) as typeof parsed;
+    } catch {
+      res.status(400).json({ ok: false, error: 'Malformed webhook JSON payload.' });
+      return;
+    }
+
+    const eventName = parsed.meta?.event_name || '';
+    const email = parsed.data?.attributes?.user_email?.trim().toLowerCase();
+    const variant = (parsed.data?.attributes?.variant_name || parsed.meta?.custom_data?.plan || '').toLowerCase();
+    const nextTier =
+      eventName === 'subscription_expired' || eventName === 'subscription_cancelled'
+        ? 'free'
+        : variant.includes('life')
+          ? 'vip_lifetime'
+          : 'pro';
+
+    const supabaseUrl = process.env.VITE_SUPABASE_URL?.trim();
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+    if (supabaseUrl && serviceKey && email) {
+      try {
+        await fetch(`${supabaseUrl}/rest/v1/profiles?email=eq.${encodeURIComponent(email)}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: serviceKey,
+            Authorization: `Bearer ${serviceKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ subscription_tier: nextTier }),
+        });
+      } catch {
+        // Non-fatal in preview mode
+      }
+    }
+
+    res.json({ ok: true, eventName, email, resolvedTier: nextTier });
   });
 
   // Universal Custom Integration & Webhook Test Dispatcher (with SSRF protection)
@@ -1543,7 +1570,7 @@ echo "SUCCESS! Return to Prob8 Settings — ${modelTag} is live at http://localh
   });
 
   app.get('/api/county-sync/status', (_req: Request, res: Response) => {
-    res.setHeader('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=900');
+    res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json({
       ok: true,
       slot: syncState.lastSlot,
@@ -1551,23 +1578,420 @@ echo "SUCCESS! Return to Prob8 Settings — ${modelTag} is live at http://localh
       countiesScanned: syncState.countiesScanned,
       totalNationwideActive: syncState.totalNationwideActive,
       newFilingsIngested: syncState.newFilingsIngested,
+      existingPropertiesUpdated: syncState.existingPropertiesUpdated,
       soldPropertiesPurged: syncState.soldPropertiesPurged,
       auctionsUpdated: syncState.auctionsUpdated,
       initialHydratedAt: syncState.initialHydratedAt,
       lastSyncedAt: syncState.lastSyncedAt,
       nextScheduledWindow: syncState.nextScheduledWindow,
       autoRunsCompleted: syncState.autoRunsCompleted,
+      syncHistory: syncState.syncHistory,
     });
   });
 
-  app.get('/api/county-sync', (req: Request, res: Response) => {
-    const slot = String(req.query.slot || 'Vercel Scheduled Mon–Fri Courthouse Sync & Purge');
-    res.json(runCourthouseSyncAndPurge(slot));
+  app.get('/api/county-sync', async (req: Request, res: Response) => {
+    const slot = String(req.query.slot || 'Scheduled Mon–Fri Courthouse & Assessor Sync');
+    res.json(await runCourthouseSyncAndPurge(slot));
   });
 
-  app.post('/api/county-sync', (req: Request, res: Response) => {
+  app.post('/api/county-sync', async (req: Request, res: Response) => {
     const { slot } = (req.body || {}) as { slot?: string };
-    res.json(runCourthouseSyncAndPurge(slot || 'Manual Admin Sync & Sold-Parcel Purge'));
+    res.json(await runCourthouseSyncAndPurge(slot || 'Manual Admin Sync, Update & Sold-Parcel Purge'));
+  });
+
+  // ---------------------------------------------------------------------------
+  // Support Inbox, Suggestions & Refund Request Endpoints (Founder Email Private)
+  // ---------------------------------------------------------------------------
+  const supportTicketsStore: SupportTicket[] = (() => {
+    try {
+      if (!process.env.VERCEL && fs.existsSync(SUPPORT_STORE_PATH)) {
+        const parsed = JSON.parse(fs.readFileSync(SUPPORT_STORE_PATH, 'utf8'));
+        return Array.isArray(parsed) ? (parsed as SupportTicket[]) : [];
+      }
+    } catch {
+      // Ignore unreadable store file
+    }
+    return [];
+  })();
+
+  const persistSupportStore = () => {
+    try {
+      if (!process.env.VERCEL) {
+        fs.writeFileSync(SUPPORT_STORE_PATH, JSON.stringify(supportTicketsStore, null, 2), 'utf8');
+      }
+    } catch {
+      // Ignore read-only fs errors
+    }
+  };
+
+  const isFounderAdminHeader = (req: Request): boolean => {
+    const headerEmail = String(req.headers['x-prob8-admin-email'] || '').trim().toLowerCase();
+    return headerEmail === FOUNDER_ADMIN_EMAIL;
+  };
+
+  app.post('/api/support/tickets', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      id?: string;
+      userId?: string;
+      userEmail?: string;
+      userName?: string;
+      subscriptionTier?: SubscriptionTier;
+      category?: string;
+      subject?: string;
+      message?: string;
+      relatedTransactionId?: string;
+      relatedOrderId?: string;
+      requestedRefundUsd?: number;
+    };
+
+    const userEmail = String(body.userEmail || '').trim().toLowerCase();
+    if (!userEmail || !userEmail.includes('@')) {
+      res.status(400).json({ ok: false, error: 'A signed-in account email is required.' });
+      return;
+    }
+
+    const validation = validateSupportTicketInput({
+      category: body.category || 'general',
+      subject: body.subject || '',
+      message: body.message || '',
+      relatedTransactionId: body.relatedTransactionId,
+      relatedOrderId: body.relatedOrderId,
+      requestedRefundUsd: body.requestedRefundUsd,
+    });
+    if (!validation.ok || !validation.normalized) {
+      res.status(400).json({ ok: false, error: validation.error || 'Invalid request payload.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const ticket: SupportTicket = {
+      id: body.id?.trim() || `tkt-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`,
+      userId: String(body.userId || 'member').trim(),
+      userEmail,
+      userName: String(body.userName || 'Prob8 Member').trim(),
+      subscriptionTier: body.subscriptionTier || 'free',
+      category: validation.normalized.category,
+      subject: validation.normalized.subject,
+      message: validation.normalized.message,
+      relatedTransactionId: validation.normalized.relatedTransactionId,
+      relatedOrderId: validation.normalized.relatedOrderId,
+      requestedRefundUsd: validation.normalized.requestedRefundUsd,
+      status: 'open',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    supportTicketsStore.unshift(ticket);
+    persistSupportStore();
+
+    // Optional private server-side notification forward without ever exposing founder email to client
+    const resendKey = process.env.RESEND_API_KEY?.trim();
+    const forwardEmail = process.env.SUPPORT_FORWARD_EMAIL?.trim();
+    if (resendKey && forwardEmail) {
+      void fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: 'Prob8 Support Desk <onboarding@resend.dev>',
+          to: [forwardEmail],
+          subject: `[Prob8 ${ticket.category.toUpperCase()}] ${ticket.subject}`,
+          text: `From: ${ticket.userName} (${ticket.userEmail})\nTier: ${ticket.subscriptionTier}\nCategory: ${ticket.category}\nOrder/Txn Ref: ${ticket.relatedOrderId || ticket.relatedTransactionId || 'None'}\n\n${ticket.message}`,
+        }),
+      }).catch(() => null);
+    }
+
+    res.status(201).json({ ok: true, ticket });
+  });
+
+  app.get('/api/support/my-tickets', (req: Request, res: Response) => {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) {
+      res.status(400).json({ ok: false, error: 'Email parameter required.' });
+      return;
+    }
+    const mine = filterAndSortSupportTickets(
+      supportTicketsStore.filter((t) => t.userEmail.toLowerCase() === email)
+    );
+    res.json({ ok: true, tickets: mine });
+  });
+
+  app.get('/api/admin/support/tickets', (req: Request, res: Response) => {
+    if (!isFounderAdminHeader(req)) {
+      res.status(403).json({ ok: false, error: 'Founder admin access required.' });
+      return;
+    }
+    res.json({ ok: true, tickets: filterAndSortSupportTickets(supportTicketsStore) });
+  });
+
+  app.patch('/api/admin/support/tickets/:id', (req: Request, res: Response) => {
+    if (!isFounderAdminHeader(req)) {
+      res.status(403).json({ ok: false, error: 'Founder admin access required.' });
+      return;
+    }
+    const id = String(req.params.id || '').trim();
+    const idx = supportTicketsStore.findIndex((t) => t.id === id);
+    if (idx === -1) {
+      res.status(404).json({ ok: false, error: 'Support ticket not found.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      status?: SupportTicketStatus;
+      adminResponse?: string;
+    };
+    const now = new Date().toISOString();
+    const nextStatus = body.status || supportTicketsStore[idx].status;
+    const updated: SupportTicket = {
+      ...supportTicketsStore[idx],
+      status: nextStatus,
+      adminResponse:
+        body.adminResponse !== undefined ? body.adminResponse.trim() : supportTicketsStore[idx].adminResponse,
+      updatedAt: now,
+      resolvedAt:
+        nextStatus === 'resolved' || nextStatus === 'refunded'
+          ? supportTicketsStore[idx].resolvedAt || now
+          : supportTicketsStore[idx].resolvedAt,
+    };
+    supportTicketsStore[idx] = updated;
+    persistSupportStore();
+    res.json({ ok: true, ticket: updated });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Lemon Squeezy Admin Integration Proxy (Account, Stores, Orders, Refunds)
+  // ---------------------------------------------------------------------------
+  const lsHeaders = (apiKey: string) => ({
+    Accept: 'application/vnd.api+json',
+    'Content-Type': 'application/vnd.api+json',
+    Authorization: `Bearer ${apiKey}`,
+  });
+
+  app.get('/api/admin/lemonsqueezy/overview', async (req: Request, res: Response) => {
+    if (!isFounderAdminHeader(req)) {
+      res.status(403).json({ ok: false, error: 'Founder admin access required.' });
+      return;
+    }
+    const apiKey = process.env.LEMONSQUEEZY_API_KEY?.trim();
+    if (!apiKey) {
+      const unconfigured: LemonSqueezyOverviewResponse = {
+        configured: false,
+        mode: 'unconfigured',
+        stores: [],
+        orders: [],
+        subscriptions: [],
+      };
+      res.json(unconfigured);
+      return;
+    }
+
+    try {
+      const headers = lsHeaders(apiKey);
+      const [meResp, storesResp, ordersResp, subsResp] = await Promise.all([
+        fetch('https://api.lemonsqueezy.com/v1/users/me', { headers, signal: AbortSignal.timeout(7000) }),
+        fetch('https://api.lemonsqueezy.com/v1/stores', { headers, signal: AbortSignal.timeout(7000) }),
+        fetch('https://api.lemonsqueezy.com/v1/orders?page[size]=25', { headers, signal: AbortSignal.timeout(7000) }),
+        fetch('https://api.lemonsqueezy.com/v1/subscriptions?page[size]=25', { headers, signal: AbortSignal.timeout(7000) }),
+      ]);
+
+      if (!meResp.ok) {
+        const errPayload = (await meResp.json().catch(() => null)) as {
+          errors?: Array<{ detail?: string; title?: string }>;
+        } | null;
+        const detail = errPayload?.errors?.[0]?.detail || `Lemon Squeezy returned HTTP ${meResp.status}`;
+        res.json({
+          configured: true,
+          mode: 'test',
+          stores: [],
+          orders: [],
+          subscriptions: [],
+          error: detail,
+        } satisfies LemonSqueezyOverviewResponse);
+        return;
+      }
+
+      const meJson = (await meResp.json()) as {
+        data?: { id?: string; attributes?: { name?: string; email?: string } };
+      };
+      const storesJson = storesResp.ok ? await storesResp.json() : { data: [] };
+      const ordersJson = ordersResp.ok ? await ordersResp.json() : { data: [] };
+      const subsJson = subsResp.ok ? await subsResp.json() : { data: [] };
+
+      const stores = normalizeLemonSqueezyStores(storesJson);
+      const orders = normalizeLemonSqueezyOrders(ordersJson);
+      const subscriptions = normalizeLemonSqueezySubscriptions(subsJson);
+      const mode = detectLemonSqueezyMode({ orders, subscriptions });
+
+      res.json({
+        configured: true,
+        mode,
+        account: {
+          id: String(meJson.data?.id ?? ''),
+          name: String(meJson.data?.attributes?.name ?? 'Prob8 Merchant'),
+          email: meJson.data?.attributes?.email ? String(meJson.data.attributes.email) : undefined,
+        },
+        stores,
+        orders,
+        subscriptions,
+      } satisfies LemonSqueezyOverviewResponse);
+    } catch (err) {
+      res.json({
+        configured: true,
+        mode: 'test',
+        stores: [],
+        orders: [],
+        subscriptions: [],
+        error: `Unable to reach Lemon Squeezy API: ${(err as Error).message}`,
+      } satisfies LemonSqueezyOverviewResponse);
+    }
+  });
+
+  app.post('/api/admin/lemonsqueezy/refund', async (req: Request, res: Response) => {
+    if (!isFounderAdminHeader(req)) {
+      res.status(403).json({ ok: false, error: 'Founder admin access required.' });
+      return;
+    }
+    const { orderId, amountCents, ticketId, reason } = (req.body || {}) as {
+      orderId?: string;
+      amountCents?: number;
+      ticketId?: string;
+      reason?: string;
+    };
+
+    const cleanOrderId = String(orderId || '').trim();
+    const apiKey = process.env.LEMONSQUEEZY_API_KEY?.trim();
+    let lsRefundResult: { refunded: boolean; remoteMessage: string; orderId?: string } = {
+      refunded: false,
+      remoteMessage: 'Local ledger updated cleanly.',
+    };
+
+    if (cleanOrderId) {
+      if (!apiKey) {
+        res.status(400).json({
+          ok: false,
+          error: 'LEMONSQUEEZY_API_KEY is not configured in server environment variables yet.',
+        });
+        return;
+      }
+
+      const numericAmountCents =
+        amountCents !== undefined && Number.isFinite(Number(amountCents)) && Number(amountCents) > 0
+          ? Math.round(Number(amountCents))
+          : undefined;
+
+      try {
+        const resp = await fetch(
+          `https://api.lemonsqueezy.com/v1/orders/${encodeURIComponent(cleanOrderId)}/refund`,
+          {
+            method: 'POST',
+            headers: lsHeaders(apiKey),
+            body: JSON.stringify({
+              data: {
+                type: 'orders',
+                id: cleanOrderId,
+                attributes: numericAmountCents ? { amount: numericAmountCents } : {},
+              },
+            }),
+            signal: AbortSignal.timeout(9000),
+          }
+        );
+
+        const payload = (await resp.json().catch(() => null)) as {
+          errors?: Array<{ detail?: string; title?: string }>;
+        } | null;
+
+        if (!resp.ok) {
+          const detail =
+            payload?.errors?.[0]?.detail ||
+            payload?.errors?.[0]?.title ||
+            `Lemon Squeezy refund API returned HTTP ${resp.status}.`;
+          res.status(resp.status).json({ ok: false, error: detail });
+          return;
+        }
+
+        lsRefundResult = {
+          refunded: true,
+          orderId: cleanOrderId,
+          remoteMessage: `Lemon Squeezy refund issued for Order #${cleanOrderId}.`,
+        };
+      } catch (err) {
+        res.status(502).json({
+          ok: false,
+          error: `Lemon Squeezy refund request failed: ${(err as Error).message}`,
+        });
+        return;
+      }
+    }
+
+    if (ticketId?.trim()) {
+      const idx = supportTicketsStore.findIndex((t) => t.id === ticketId.trim());
+      if (idx !== -1) {
+        const now = new Date().toISOString();
+        supportTicketsStore[idx] = {
+          ...supportTicketsStore[idx],
+          status: 'refunded',
+          adminResponse:
+            reason?.trim() ||
+            supportTicketsStore[idx].adminResponse ||
+            'Refund processed and confirmed.',
+          updatedAt: now,
+          resolvedAt: now,
+        };
+        persistSupportStore();
+      }
+    }
+
+    res.json({
+      ok: true,
+      ...lsRefundResult,
+    });
+  });
+
+  app.post('/api/admin/lemonsqueezy/subscriptions/:id/cancel', async (req: Request, res: Response) => {
+    if (!isFounderAdminHeader(req)) {
+      res.status(403).json({ ok: false, error: 'Founder admin access required.' });
+      return;
+    }
+    const subId = String(req.params.id || '').trim();
+    const apiKey = process.env.LEMONSQUEEZY_API_KEY?.trim();
+    if (!subId) {
+      res.status(400).json({ ok: false, error: 'Subscription ID required.' });
+      return;
+    }
+    if (!apiKey) {
+      res.status(400).json({
+        ok: false,
+        error: 'LEMONSQUEEZY_API_KEY is not configured in server environment variables.',
+      });
+      return;
+    }
+    try {
+      const resp = await fetch(
+        `https://api.lemonsqueezy.com/v1/subscriptions/${encodeURIComponent(subId)}`,
+        {
+          method: 'DELETE',
+          headers: lsHeaders(apiKey),
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (!resp.ok) {
+        const errPayload = (await resp.json().catch(() => null)) as {
+          errors?: Array<{ detail?: string }>;
+        } | null;
+        res.status(resp.status).json({
+          ok: false,
+          error: errPayload?.errors?.[0]?.detail || `HTTP ${resp.status}`,
+        });
+        return;
+      }
+      res.json({ ok: true, subscriptionId: subId, message: `Subscription #${subId} cancelled cleanly.` });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: `Subscription cancel failed: ${(err as Error).message}`,
+      });
+    }
   });
 
   return app;

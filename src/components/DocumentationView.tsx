@@ -5,6 +5,7 @@ import {
   Cpu,
   Database,
   Link2,
+  MessageSquare,
   Scale,
   Search,
   ShieldCheck,
@@ -36,14 +37,14 @@ const DOC_SECTIONS: DocSection[] = [
     steps: [
       'Search any US State, County, City, or 5-digit ZIP Code in the Discover search bar or tap Near Me for instant GPS targeting.',
       'Urgency badges highlight filing windows: Filed <14 Days Ago (emerald), Prime Window 21-45 Days (amber), Motivated 90+ Days (rose), and Live Auction Scheduled (indigo).',
-      'Free tier unlocks 5 full dossiers per county (10 nationwide) with zero credit card required. Prob8 Pro ($79/mo after 7-day trial), VIP Lifetime, and Founder Admin unlock 100% of all 50 states + DC.',
+      'Free tier unlocks up to 2 full dossiers per county across every county nationwide with zero credit card required, clearly displaying how many active filings remain locked. Prob8 Pro ($79/mo after 7-day trial), VIP Lifetime, and Founder Admin unlock 100% on both Map and List.',
     ],
   },
   {
     id: 'courthouse-sync',
     category: 'User Manual',
-    title: 'Automated Monday–Friday 11:00 AM & 4:00 PM Sync & Sold-Parcel Purge',
-    body: 'Every weekday (Monday–Friday) at 11:00 AM ET and 4:00 PM ET, Prob8 runs an automated multi-county clerk sync and dead-deal purge across all 51 jurisdictions (50 states + DC).',
+    title: 'Automated Monday–Friday 11:00 AM & 3:00 PM Sync & Sold-Parcel Purge',
+    body: 'Every weekday (Monday–Friday) at 11:00 AM ET and 3:00 PM ET, Prob8 runs an automated multi-county clerk sync, milestone status refresh, and dead-deal purge across all 51 jurisdictions (50 states + DC / 3,143 counties).',
     steps: [
       'Ingests newly docketed probate petitions, amended estate inventories, and newly posted sheriff/probate overbid auction dates.',
       'Automatically purges and archives sold, transferred, or dismissed estate listings so your Buy-Boxes and Discover feed never waste outreach on closed parcels.',
@@ -144,7 +145,11 @@ const DOC_SECTIONS: DocSection[] = [
   },
 ];
 
-export const DocumentationView: React.FC = () => {
+interface DocumentationViewProps {
+  onOpenSupport?: () => void;
+}
+
+export const DocumentationView: React.FC<DocumentationViewProps> = ({ onOpenSupport }) => {
   const [search, setSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<'All' | DocCategory>('All');
 
@@ -197,20 +202,32 @@ export const DocumentationView: React.FC = () => {
             Prob8 Complete Platform Manual &amp; Regulatory Guide
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Searchable operations manual covering Prob8 Underwriting formulas, 1-Click Local Ollama, M–F 11 AM &amp; 4 PM courthouse sync, and Federal/State compliance laws.
+            Searchable operations manual covering Prob8 Underwriting formulas, 1-Click Local Ollama, M–F 11 AM &amp; 3 PM ET courthouse sync, and Federal/State compliance laws.
           </p>
         </div>
 
-        <div className="relative w-full sm:w-80">
-          <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
-          <input
-            type="text"
-            aria-label="Search documentation"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search guides, laws, formulas..."
-            className="w-full h-10 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] pl-9 pr-3 text-sm text-slate-900 dark:text-white"
-          />
+        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+          <div className="relative flex-1 sm:w-72">
+            <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+            <input
+              type="text"
+              aria-label="Search documentation"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search guides, laws, formulas..."
+              className="w-full h-10 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#111827] pl-9 pr-3 text-sm text-slate-900 dark:text-white"
+            />
+          </div>
+          {onOpenSupport && (
+            <button
+              type="button"
+              onClick={onOpenSupport}
+              className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-[#0F766E] px-4 text-xs font-semibold text-white hover:bg-[#0D625B] whitespace-nowrap"
+            >
+              <MessageSquare className="h-3.5 w-3.5" />
+              Contact, Suggestions &amp; Refunds
+            </button>
+          )}
         </div>
       </div>
 

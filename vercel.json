@@ -27,8 +27,8 @@
       "schedule": "0 16 * * 1-5"
     },
     {
-      "path": "/api/county-sync?slot=Afternoon+4PM+Sync",
-      "schedule": "0 21 * * 1-5"
+      "path": "/api/county-sync?slot=Afternoon+3PM+Sync",
+      "schedule": "0 20 * * 1-5"
     }
   ]
 }

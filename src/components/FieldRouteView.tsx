@@ -1,10 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import {
-  AdvancedMarker,
   APILoadingStatus,
   InfoWindow,
   Map as GoogleMap,
-  Pin,
   useApiIsLoaded,
   useApiLoadingStatus,
 } from '@vis.gl/react-google-maps';
@@ -16,11 +14,17 @@ import {
   MapPin,
   Navigation,
   Plus,
+  Route,
   Trash2,
   UserPlus,
 } from 'lucide-react';
 import type { FieldRouteStop, PipelineDeal, PropertyRecord } from '../types';
 import { formatCurrency, formatDateShort } from '../utils/formatters';
+import { optimizeFieldRouteOrder } from '../utils/routeOptimizer';
+import { ErrorBoundary } from './ErrorBoundary';
+import { SafeMapMarker } from './SafeMapMarker';
+
+const HAS_GOOGLE_MAPS_KEY = Boolean((import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim());
 
 interface FieldRouteViewProps {
   stops: FieldRouteStop[];
@@ -38,6 +42,7 @@ interface FieldRouteViewProps {
   }) => void;
   onAddPropertyStop: (property: PropertyRecord, conditionTag?: FieldRouteStop['conditionTag']) => void;
   onRemoveStop: (stopId: string) => void;
+  onReorderStops?: (ordered: FieldRouteStop[]) => void;
   onQuickAddToPipeline: (stop: FieldRouteStop) => void;
   onQuickAddToCrm: (stop: FieldRouteStop) => void;
   onOpenDossier: (property: PropertyRecord) => void;
@@ -58,6 +63,7 @@ export const FieldRouteView: React.FC<FieldRouteViewProps> = ({
   onPinCurrentGps,
   onAddPropertyStop,
   onRemoveStop,
+  onReorderStops,
   onQuickAddToPipeline,
   onQuickAddToCrm,
   onOpenDossier,
@@ -70,11 +76,6 @@ export const FieldRouteView: React.FC<FieldRouteViewProps> = ({
   const [geoMessage, setGeoMessage] = useState<string | null>(null);
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
   const [propertyToImportId, setPropertyToImportId] = useState('');
-
-  const isApiLoaded = useApiIsLoaded();
-  const apiStatus = useApiLoadingStatus();
-  const mapsUnavailable =
-    apiStatus === APILoadingStatus.FAILED || apiStatus === APILoadingStatus.AUTH_FAILURE;
 
   const availableImports = useMemo(() => {
     const existingPropIds = new Set(stops.map((s) => s.property?.id).filter(Boolean));
@@ -175,15 +176,31 @@ export const FieldRouteView: React.FC<FieldRouteViewProps> = ({
           </div>
 
           {stops.length > 0 && (
-            <a
-              href={googleMapsDirectionsUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex h-11 items-center gap-2 rounded-xl bg-slate-900 dark:bg-emerald-600 px-4 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
-            >
-              <ExternalLink className="h-4 w-4" />
-              Launch Turn-by-Turn Route
-            </a>
+            <div className="flex flex-wrap items-center gap-2">
+              {stops.length > 1 && onReorderStops && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const { ordered, totalDistanceMiles } = optimizeFieldRouteOrder(stops);
+                    onReorderStops(ordered);
+                    setGeoMessage(`Optimized ${ordered.length} stops (~${totalDistanceMiles} mi shortest path).`);
+                  }}
+                  className="inline-flex h-11 items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#090D16] px-4 text-xs font-semibold text-slate-800 dark:text-white hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                >
+                  <Route className="h-4 w-4 text-[#0F766E] dark:text-emerald-400" />
+                  Optimize Stop Order
+                </button>
+              )}
+              <a
+                href={googleMapsDirectionsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex h-11 items-center gap-2 rounded-xl bg-slate-900 dark:bg-emerald-600 px-4 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
+              >
+                <ExternalLink className="h-4 w-4" />
+                Launch Turn-by-Turn Route
+              </a>
+            </div>
           )}
         </div>
 
@@ -378,7 +395,7 @@ export const FieldRouteView: React.FC<FieldRouteViewProps> = ({
 
           {/* Right Live Google Map with Tap-to-Inspect Pins */}
           <div className="lg:col-span-7 min-h-[420px] lg:min-h-[580px] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-[#111827]">
-            {mapsUnavailable || !isApiLoaded ? (
+            {!HAS_GOOGLE_MAPS_KEY ? (
               <div className="flex h-full min-h-[420px] flex-col items-center justify-center bg-slate-900 p-6 text-center text-white">
                 <Navigation className="h-8 w-8 text-[#5EEAD4]" />
                 <p className="mt-3 font-display text-base font-semibold">
@@ -389,62 +406,109 @@ export const FieldRouteView: React.FC<FieldRouteViewProps> = ({
                 </p>
               </div>
             ) : (
-              <GoogleMap
-                mapId="DEMO_MAP_ID"
-                defaultCenter={mapCenter}
-                defaultZoom={stops.length > 1 ? 11 : 14}
-                gestureHandling="greedy"
-                internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-                style={{ width: '100%', height: '100%', minHeight: '420px' }}
-              >
-                {stops.map((stop, idx) => (
-                  <AdvancedMarker
-                    key={stop.id}
-                    position={{ lat: stop.lat, lng: stop.lng }}
-                    title={`Stop ${idx + 1}: ${stop.address}`}
-                    onClick={() => setSelectedStopId(stop.id)}
-                  >
-                    <Pin
-                      background="#0F766E"
-                      borderColor="#FFFFFF"
-                      glyphColor="#FFFFFF"
-                      glyph={String(idx + 1)}
-                    />
-                  </AdvancedMarker>
-                ))}
-
-                {selectedStop && (
-                  <InfoWindow
-                    position={{ lat: selectedStop.lat, lng: selectedStop.lng }}
-                    onCloseClick={() => setSelectedStopId(null)}
-                  >
-                    <div className="min-w-[190px] p-1 text-slate-900 space-y-1.5">
-                      <p className="font-display text-xs font-bold">{selectedStop.address}</p>
-                      <p className="text-[11px] text-slate-500">{selectedStop.conditionTag}</p>
-                      <div className="flex gap-1.5 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => onQuickAddToPipeline(selectedStop)}
-                          className="flex-1 rounded bg-[#0F766E] px-2 py-1 text-[11px] font-semibold text-white"
-                        >
-                          + Pipeline
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onQuickAddToCrm(selectedStop)}
-                          className="flex-1 rounded bg-slate-900 px-2 py-1 text-[11px] font-semibold text-white"
-                        >
-                          + CRM
-                        </button>
-                      </div>
-                    </div>
-                  </InfoWindow>
-                )}
-              </GoogleMap>
+              <LiveFieldRouteMap
+                stops={stops}
+                mapCenter={mapCenter}
+                selectedStop={selectedStop}
+                onSelectStop={setSelectedStopId}
+                onQuickAddToPipeline={onQuickAddToPipeline}
+                onQuickAddToCrm={onQuickAddToCrm}
+              />
             )}
           </div>
         </div>
       )}
     </div>
+  );
+};
+
+const LiveFieldRouteMap: React.FC<{
+  stops: FieldRouteStop[];
+  mapCenter: { lat: number; lng: number };
+  selectedStop: FieldRouteStop | null;
+  onSelectStop: (id: string | null) => void;
+  onQuickAddToPipeline: (stop: FieldRouteStop) => void;
+  onQuickAddToCrm: (stop: FieldRouteStop) => void;
+}> = ({ stops, mapCenter, selectedStop, onSelectStop, onQuickAddToPipeline, onQuickAddToCrm }) => {
+  const isApiLoaded = useApiIsLoaded();
+  const apiStatus = useApiLoadingStatus();
+  const [authFailed, setAuthFailed] = useState<boolean>(() =>
+    Boolean((window as unknown as { __prob8MapsUnavailable?: boolean }).__prob8MapsUnavailable)
+  );
+
+  React.useEffect(() => {
+    const onQuota = () => setAuthFailed(true);
+    window.addEventListener('gmp-quota-exceeded', onQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
+  }, []);
+
+  const mapsUnavailable =
+    authFailed || apiStatus === APILoadingStatus.FAILED || apiStatus === APILoadingStatus.AUTH_FAILURE;
+
+  const fallbackView = (
+    <div className="flex h-full min-h-[420px] flex-col items-center justify-center bg-slate-900 p-6 text-center text-white">
+      <Navigation className="h-8 w-8 text-[#5EEAD4]" />
+      <p className="mt-3 font-display text-base font-semibold">
+        Field Route Pin Tracker Ready ({stops.length} stops)
+      </p>
+      <p className="mt-1 max-w-sm text-xs text-slate-300">
+        Tap any stop on the left or click Launch Turn-by-Turn Route above.
+      </p>
+    </div>
+  );
+
+  if (mapsUnavailable || !isApiLoaded) {
+    return fallbackView;
+  }
+
+  return (
+    <ErrorBoundary fallback={fallbackView}>
+      <GoogleMap
+        defaultCenter={mapCenter}
+        defaultZoom={stops.length > 1 ? 11 : 14}
+        gestureHandling="greedy"
+        internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
+        style={{ width: '100%', height: '100%', minHeight: '420px' }}
+      >
+        {stops.map((stop, idx) => (
+          <SafeMapMarker
+            key={stop.id}
+            position={{ lat: stop.lat, lng: stop.lng }}
+            title={`Stop ${idx + 1}: ${stop.address}`}
+            color="#0F766E"
+            glyph={String(idx + 1)}
+            onClick={() => onSelectStop(stop.id)}
+          />
+        ))}
+
+        {selectedStop && (
+          <InfoWindow
+            position={{ lat: selectedStop.lat, lng: selectedStop.lng }}
+            onCloseClick={() => onSelectStop(null)}
+          >
+            <div className="min-w-[190px] p-1 text-slate-900 space-y-1.5">
+              <p className="font-display text-xs font-bold">{selectedStop.address}</p>
+              <p className="text-[11px] text-slate-500">{selectedStop.conditionTag}</p>
+              <div className="flex gap-1.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => onQuickAddToPipeline(selectedStop)}
+                  className="flex-1 rounded bg-[#0F766E] px-2 py-1 text-[11px] font-semibold text-white"
+                >
+                  + Pipeline
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onQuickAddToCrm(selectedStop)}
+                  className="flex-1 rounded bg-slate-900 px-2 py-1 text-[11px] font-semibold text-white"
+                >
+                  + CRM
+                </button>
+              </div>
+            </div>
+          </InfoWindow>
+        )}
+      </GoogleMap>
+    </ErrorBoundary>
   );
 };

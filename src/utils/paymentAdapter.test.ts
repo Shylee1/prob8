@@ -5,7 +5,9 @@ import {
   calculateAffiliateCommission,
   calculateCheckoutTotals,
   exportLedgerToCsv,
+  extractReferralParams,
   formatTierLabel,
+  getLemonSqueezyAffiliateId,
   isEligibleForAffiliatePayout,
   validatePromoCode,
 } from './paymentAdapter';
@@ -128,4 +130,36 @@ test('validatePromoCode validates active, paused, exhausted, expired, and unknow
   assert.equal(validatePromoCode('EXPIRED10', promos, refDate).ok, false);
   assert.equal(validatePromoCode('DOESNOTEXIST', promos, refDate).ok, false);
 });
+
+test('extractReferralParams parses ?ref= and Lemon Squeezy ?aff= parameters cleanly', () => {
+  assert.deepEqual(extractReferralParams('?ref=founder8'), {
+    refCode: 'FOUNDER8',
+    lemonSqueezyAffId: undefined,
+  });
+  assert.deepEqual(extractReferralParams('?aff=ls_9921a'), {
+    refCode: undefined,
+    lemonSqueezyAffId: 'ls_9921a',
+  });
+  assert.deepEqual(extractReferralParams('?ref=vip10&aff=7788'), {
+    refCode: 'VIP10',
+    lemonSqueezyAffId: '7788',
+  });
+  assert.deepEqual(extractReferralParams(''), {
+    refCode: undefined,
+    lemonSqueezyAffId: undefined,
+  });
+});
+
+test('getLemonSqueezyAffiliateId reads LemonSqueezy.Affiliate.GetId() safely', () => {
+  assert.equal(getLemonSqueezyAffiliateId({}), undefined);
+  assert.equal(
+    getLemonSqueezyAffiliateId({ LemonSqueezy: { Affiliate: { GetId: () => 'aff_12345' } } }),
+    'aff_12345'
+  );
+  assert.equal(
+    getLemonSqueezyAffiliateId({ LemonSqueezy: { Affiliate: { GetId: () => 90210 } } }),
+    '90210'
+  );
+});
+
 

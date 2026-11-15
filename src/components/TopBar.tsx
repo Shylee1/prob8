@@ -7,6 +7,7 @@ import {
   Download,
   Link2,
   Menu,
+  MessageSquare,
   Moon,
   Navigation,
   Scale,
@@ -31,6 +32,7 @@ export type AppView =
   | 'route'
   | 'docs'
   | 'affiliate'
+  | 'support'
   | 'settings'
   | 'admin'
   | 'legal';
@@ -42,6 +44,7 @@ interface TopBarProps {
   peopleCount: number;
   portfolioCount: number;
   buyBoxCount: number;
+  openSupportCount?: number;
   subscriptionTier: SubscriptionTier;
   isAdmin: boolean;
   isDark: boolean;
@@ -57,6 +60,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   peopleCount,
   portfolioCount,
   buyBoxCount,
+  openSupportCount = 0,
   subscriptionTier,
   isAdmin,
   isDark,
@@ -82,9 +86,16 @@ export const TopBar: React.FC<TopBarProps> = ({
     { id: 'portfolio', label: 'Portfolio', count: portfolioCount, icon: <Building className="h-4 w-4" /> },
     { id: 'route', label: 'Field Route', icon: <Navigation className="h-4 w-4" /> },
     { id: 'docs', label: 'Documentation & Help', icon: <BookOpen className="h-4 w-4" /> },
+    { id: 'support', label: 'Contact, Suggestions & Refunds', icon: <MessageSquare className="h-4 w-4" /> },
     { id: 'affiliate', label: 'Become an Affiliate', icon: <Link2 className="h-4 w-4" /> },
     { id: 'settings', label: 'Settings', icon: <Settings className="h-4 w-4" /> },
-    { id: 'admin', label: 'Admin Dashboard', icon: <ShieldAlert className="h-4 w-4" />, adminOnly: true },
+    {
+      id: 'admin',
+      label: 'Admin Dashboard',
+      count: isAdmin && openSupportCount > 0 ? openSupportCount : undefined,
+      icon: <ShieldAlert className="h-4 w-4" />,
+      adminOnly: true,
+    },
   ];
 
   const handleNav = (view: AppView) => {
@@ -119,9 +130,7 @@ export const TopBar: React.FC<TopBarProps> = ({
               onClick={() => handleNav('discover')}
               className="flex items-center gap-2 font-display text-xl font-extrabold tracking-tight text-slate-900 dark:text-white whitespace-nowrap"
             >
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-[#0F766E] text-xs font-mono font-bold text-white">
-                P8
-              </span>
+              <img src="/icon.svg?v=3" alt="Prob8 Logo" className="h-7 w-7 rounded-lg" />
               <span>Prob8</span>
             </button>
           </div>
@@ -193,9 +202,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             <div className="flex h-14 items-center justify-between border-b border-slate-200 dark:border-slate-800 px-4">
               <div className="flex items-center gap-2">
-                <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-[#0F766E] text-xs font-mono font-bold text-white">
-                  P8
-                </span>
+                <img src="/icon.svg?v=3" alt="Prob8 Logo" className="h-7 w-7 rounded-lg" />
                 <div className="min-w-0">
                   <p className="font-display text-sm font-bold text-slate-900 dark:text-white leading-tight">
                     Prob8

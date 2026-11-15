@@ -21,17 +21,22 @@ function computeCompassHeading(fromLat: number, fromLng: number, toLat: number, 
   return Number.isFinite(raw) ? Number(raw.toFixed(1)) : 0;
 }
 
-export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
-  lat,
-  lng,
-  address,
-  heightClass = 'h-[320px] sm:h-[380px]',
-}) => {
+const HAS_GOOGLE_MAPS_KEY = Boolean((import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim());
+
+const LiveStreetView: React.FC<{
+  lat: number;
+  lng: number;
+  address: string;
+  heightClass: string;
+  externalStreetViewUrl: string;
+}> = ({ lat, lng, address, heightClass, externalStreetViewUrl }) => {
   const isApiLoaded = useApiIsLoaded();
   const streetViewLib = useMapsLibrary('streetView');
   const geocodingLib = useMapsLibrary('geocoding');
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [status, setStatus] = useState<'loading' | 'available' | 'unavailable'>('loading');
+  const [status, setStatus] = useState<'loading' | 'available' | 'unavailable'>(() =>
+    (window as unknown as { __prob8MapsUnavailable?: boolean }).__prob8MapsUnavailable ? 'unavailable' : 'loading'
+  );
   const [resolvedPos, setResolvedPos] = useState<{ lat: number; lng: number; heading: number }>({
     lat,
     lng,
@@ -39,10 +44,20 @@ export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
   });
 
   useEffect(() => {
+    const onQuota = () => setStatus('unavailable');
+    window.addEventListener('gmp-quota-exceeded', onQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
+  }, []);
+
+  useEffect(() => {
     setResolvedPos({ lat, lng, heading: 0 });
   }, [lat, lng, address]);
 
   useEffect(() => {
+    if ((window as unknown as { __prob8MapsUnavailable?: boolean }).__prob8MapsUnavailable) {
+      setStatus('unavailable');
+      return;
+    }
     if (!isApiLoaded || !streetViewLib || !containerRef.current) return;
 
     let cancelled = false;
@@ -52,7 +67,6 @@ export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
       let targetLat = lat;
       let targetLng = lng;
 
-      // 1. Geocode exact street address so camera targets the true parcel rooftop instead of coarse city coordinates
       if (geocodingLib && address.trim() && !address.startsWith('GPS ')) {
         try {
           const geocoder = new geocodingLib.Geocoder();
@@ -128,8 +142,6 @@ export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
     };
   }, [isApiLoaded, streetViewLib, geocodingLib, lat, lng, address]);
 
-  const externalStreetViewUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${resolvedPos.lat},${resolvedPos.lng}&heading=${resolvedPos.heading}&pitch=4`;
-
   return (
     <div className={`relative w-full overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-900 ${heightClass}`}>
       <div ref={containerRef} className="h-full w-full min-h-[220px]" />
@@ -168,5 +180,48 @@ export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
         </div>
       )}
     </div>
+  );
+};
+
+export const StreetViewPanel: React.FC<StreetViewPanelProps> = ({
+  lat,
+  lng,
+  address,
+  heightClass = 'h-[320px] sm:h-[380px]',
+}) => {
+  const externalStreetViewUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}&heading=0&pitch=4`;
+
+  if (!HAS_GOOGLE_MAPS_KEY) {
+    return (
+      <div className={`relative flex w-full flex-col items-center justify-center overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-900 p-6 text-center text-white ${heightClass}`}>
+        <div className="flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-[#5EEAD4]">
+          <Compass className="h-5 w-5" />
+        </div>
+        <p className="mt-3 text-sm font-semibold">Street View Coordinates Ready</p>
+        <p className="mt-1 text-xs text-slate-300 max-w-md">
+          {address} · {lat.toFixed(5)}, {lng.toFixed(5)}
+        </p>
+        <a
+          href={externalStreetViewUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#0D625B]"
+        >
+          <MapPin className="h-3.5 w-3.5" />
+          Open Street View in Google Maps
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <LiveStreetView
+      lat={lat}
+      lng={lng}
+      address={address}
+      heightClass={heightClass}
+      externalStreetViewUrl={externalStreetViewUrl}
+    />
   );
 };

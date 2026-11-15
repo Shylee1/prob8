@@ -14,6 +14,7 @@ interface AuthAndProModalProps {
   promoCodes?: PromoCode[];
   onUpdateProfile: (patch: Partial<UserProfile>) => void;
   onCheckoutPlan: (plan: 'pro' | 'vip_lifetime', isTrial?: boolean, promoCode?: string) => void;
+  onOpenSupport?: () => void;
   onSignOut: () => void;
   onClose: () => void;
 }
@@ -34,6 +35,7 @@ export const AuthAndProModal: React.FC<AuthAndProModalProps> = ({
   promoCodes = [],
   onUpdateProfile,
   onCheckoutPlan,
+  onOpenSupport,
   onSignOut,
   onClose,
 }) => {
@@ -330,17 +332,31 @@ export const AuthAndProModal: React.FC<AuthAndProModalProps> = ({
                     Zero-Data-Harvesting Guarantee: Your Pipeline, CRM, Portfolio, and AI keys stay strictly isolated inside your Prob8 workspace.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose();
-                    onSignOut();
-                  }}
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-rose-200 dark:border-rose-900 px-3 text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30"
-                >
-                  <LogOut className="h-3.5 w-3.5" />
-                  Sign Out of Prob8
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {onOpenSupport && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onOpenSupport();
+                      }}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      Suggestions, Help or Refund Request
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onSignOut();
+                    }}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-rose-200 dark:border-rose-900 px-3 text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Sign Out of Prob8
+                  </button>
+                </div>
               </div>
             </div>
           </div>

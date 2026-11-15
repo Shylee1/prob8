@@ -3,6 +3,7 @@ import { AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface ErrorBoundaryProps {
   fallbackTitle?: string;
+  fallback?: React.ReactNode;
   children: React.ReactNode;
 }
 
@@ -30,6 +31,9 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   render() {
     if (this.state.hasError) {
+      if (this.props.fallback) {
+        return <>{this.props.fallback}</>;
+      }
       return (
         <div className="mx-auto max-w-xl my-12 rounded-2xl border border-rose-200 dark:border-rose-900 bg-white dark:bg-[#111827] p-6 text-center space-y-4">
           <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400">

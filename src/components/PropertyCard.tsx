@@ -1,8 +1,9 @@
 import React from 'react';
-import { Building2, Compass, Gavel, MapPin } from 'lucide-react';
+import { Building2, Compass, Flame, Gavel, MapPin } from 'lucide-react';
 import type { PropertyRecord } from '../types';
 import { formatCurrency } from '../utils/formatters';
 import { resolveSmartPropertyMedia } from '../utils/mediaGallery';
+import { calculateMotivationScore } from '../utils/motivationScore';
 import { getProbateUrgencyBadge } from '../utils/probateTiming';
 
 interface PropertyCardProps {
@@ -29,6 +30,7 @@ export const PropertyCard: React.FC<PropertyCardProps> = ({
 }) => {
   const media = resolveSmartPropertyMedia(property.zillowData.photos, property.redfinData.photos);
   const urgency = getProbateUrgencyBadge(property.filingDate, property.status);
+  const motivation = calculateMotivationScore(property);
 
   return (
     <button
@@ -91,12 +93,25 @@ export const PropertyCard: React.FC<PropertyCardProps> = ({
             </div>
           </div>
 
-          {/* Urgency Badge + Specs */}
+          {/* Urgency Badge + Motivation Score + Specs */}
           <div className="mt-2.5 flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
             <span
               className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${BADGE_CLASSES[urgency.tone]}`}
             >
               {urgency.label}
+            </span>
+            <span
+              title={motivation.factors.join(' · ') || 'Base probate score'}
+              className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px] font-bold tabular-nums ${
+                motivation.tier === 'Hot'
+                  ? 'border-rose-500/30 bg-rose-500/12 text-rose-700 dark:text-rose-300'
+                  : motivation.tier === 'Warm'
+                    ? 'border-amber-500/30 bg-amber-500/12 text-amber-700 dark:text-amber-300'
+                    : 'border-slate-300/60 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+              }`}
+            >
+              <Flame className="h-3 w-3" />
+              {motivation.tier} {motivation.score}
             </span>
             <span className="inline-flex items-center gap-1 font-medium text-slate-800 dark:text-slate-200">
               <Building2 className="h-3.5 w-3.5 text-slate-400" />

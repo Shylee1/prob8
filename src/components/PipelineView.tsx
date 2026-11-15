@@ -25,6 +25,8 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
   onOpenUpgradeModal,
 }) => {
   const [viewMode, setViewMode] = useState<'board' | 'table'>('board');
+  const [draggedDealId, setDraggedDealId] = useState<string | null>(null);
+  const [dragOverStage, setDragOverStage] = useState<PipelineStage | null>(null);
 
   const hasProAccess = subscriptionTier === 'pro' || subscriptionTier === 'vip_lifetime';
 
@@ -121,7 +123,27 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
               <section
                 key={stage}
                 aria-label={stage}
-                className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0D1320] p-3.5 flex flex-col gap-3"
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  if (dragOverStage !== stage) setDragOverStage(stage);
+                }}
+                onDragLeave={() => {
+                  if (dragOverStage === stage) setDragOverStage(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const droppedId = e.dataTransfer.getData('text/plain') || draggedDealId;
+                  if (droppedId) {
+                    onUpdateStage(droppedId, stage);
+                  }
+                  setDraggedDealId(null);
+                  setDragOverStage(null);
+                }}
+                className={`rounded-2xl border p-3.5 flex flex-col gap-3 transition-colors ${
+                  dragOverStage === stage
+                    ? 'border-[#0F766E] bg-emerald-500/10'
+                    : 'border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0D1320]'
+                }`}
               >
                 <div className="flex items-center justify-between px-1">
                   <h2 className="text-xs font-bold text-slate-800 dark:text-slate-200">{stage}</h2>
@@ -132,23 +154,51 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
 
                 {stageDeals.length === 0 ? (
                   <p className="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 py-6 text-center text-xs text-slate-400">
-                    No deals in this stage
+                    Drop deal here or select stage
                   </p>
                 ) : (
                   <div className="space-y-2.5">
-                    {stageDeals.map((deal) => (
+                    {stageDeals.map((deal) => {
+                      const daysInStage = Math.max(
+                        0,
+                        Math.floor((Date.now() - Date.parse(deal.updatedAt)) / 86400000)
+                      );
+                      const isStale = daysInStage >= 7;
+                      return (
                       <div
                         key={deal.id}
-                        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-3.5 shadow-2xs space-y-2.5"
+                        draggable
+                        onDragStart={(e) => {
+                          setDraggedDealId(deal.id);
+                          e.dataTransfer.setData('text/plain', deal.id);
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onDragEnd={() => {
+                          setDraggedDealId(null);
+                          setDragOverStage(null);
+                        }}
+                        className={`cursor-grab active:cursor-grabbing rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-3.5 shadow-2xs space-y-2.5 transition-opacity ${
+                          draggedDealId === deal.id ? 'opacity-60' : ''
+                        }`}
                       >
                         <button
                           type="button"
                           onClick={() => onSelectProperty(deal.property)}
                           className="w-full text-left group"
                         >
-                          <p className="font-display text-sm font-bold text-slate-900 dark:text-white group-hover:text-[#0F766E] dark:group-hover:text-emerald-400 truncate">
-                            {deal.property.address}
-                          </p>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="font-display text-sm font-bold text-slate-900 dark:text-white group-hover:text-[#0F766E] dark:group-hover:text-emerald-400 truncate">
+                              {deal.property.address}
+                            </p>
+                            {isStale && (
+                              <span
+                                title="Untouched for 7+ days"
+                                className="shrink-0 rounded-md border border-amber-500/30 bg-amber-500/12 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-700 dark:text-amber-300"
+                              >
+                                {daysInStage}d stale
+                              </span>
+                            )}
+                          </div>
                           <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
                             {deal.property.city}, {deal.property.state} · {deal.property.probateCaseNumber}
                           </p>
@@ -194,7 +244,8 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
                           </button>
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </section>

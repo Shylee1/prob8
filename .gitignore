@@ -7,6 +7,7 @@ coverage/
 .env*
 !.env.example
 .prob8-vapid.json
+.prob8-support-tickets.json
 .playwright-cli/
 *.keystore
 *.jks

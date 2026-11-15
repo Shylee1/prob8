@@ -1,8 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Map as GoogleMap,
-  AdvancedMarker,
-  Pin,
   useMap,
   useMapsLibrary,
 } from '@vis.gl/react-google-maps';
@@ -54,6 +52,7 @@ import {
 import { getProbateUrgencyBadge } from '../utils/probateTiming';
 import { buildLocalizedLoiTemplate, getCountyResourcesForProperty } from '../utils/countyResources';
 import { formatCurrency, formatDateShort } from '../utils/formatters';
+import { SafeMapMarker } from './SafeMapMarker';
 import { StreetViewPanel } from './StreetViewPanel';
 
 interface PropertyDossierModalProps {
@@ -201,7 +200,9 @@ const ProbateComplianceGuidancePanel: React.FC<{ property: PropertyRecord }> = (
   );
 };
 
-const SatelliteViewPanel: React.FC<{
+const HAS_GOOGLE_MAPS_KEY = Boolean((import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined)?.trim());
+
+const LiveSatelliteMap: React.FC<{
   lat: number;
   lng: number;
   address: string;
@@ -209,13 +210,22 @@ const SatelliteViewPanel: React.FC<{
   const map = useMap('dossier-satellite-map');
   const geocodingLib = useMapsLibrary('geocoding');
   const [resolvedPos, setResolvedPos] = useState<{ lat: number; lng: number }>({ lat, lng });
+  const [mapsFailed, setMapsFailed] = useState<boolean>(() =>
+    Boolean((window as unknown as { __prob8MapsUnavailable?: boolean }).__prob8MapsUnavailable)
+  );
+
+  useEffect(() => {
+    const onQuota = () => setMapsFailed(true);
+    window.addEventListener('gmp-quota-exceeded', onQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
+  }, []);
 
   useEffect(() => {
     setResolvedPos({ lat, lng });
   }, [lat, lng, address]);
 
   useEffect(() => {
-    if (!geocodingLib || !address.trim() || address.startsWith('GPS ')) return;
+    if (mapsFailed || !geocodingLib || !address.trim() || address.startsWith('GPS ')) return;
     let cancelled = false;
     const geocoder = new geocodingLib.Geocoder();
     geocoder
@@ -236,7 +246,7 @@ const SatelliteViewPanel: React.FC<{
     return () => {
       cancelled = true;
     };
-  }, [geocodingLib, address, lat, lng]);
+  }, [mapsFailed, geocodingLib, address, lat, lng]);
 
   useEffect(() => {
     if (!map) return;
@@ -245,11 +255,29 @@ const SatelliteViewPanel: React.FC<{
     map.setZoom(19);
   }, [map, resolvedPos]);
 
+  if (mapsFailed) {
+    return (
+      <div className="flex h-[340px] sm:h-[400px] flex-col items-center justify-center rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-900 p-6 text-center text-white">
+        <Compass className="h-7 w-7 text-[#5EEAD4]" />
+        <p className="mt-3 text-sm font-semibold">Satellite Parcel Coordinates Locked</p>
+        <p className="mt-1 text-xs text-slate-300">{address} ({resolvedPos.lat.toFixed(5)}, {resolvedPos.lng.toFixed(5)})</p>
+        <a
+          href={`https://www.google.com/maps/@${resolvedPos.lat},${resolvedPos.lng},19z/data=!3m1!1e3`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#0D625B]"
+        >
+          Open Satellite in Google Maps
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+    );
+  }
+
   return (
     <div className="relative h-[340px] sm:h-[400px] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800">
       <GoogleMap
         id="dossier-satellite-map"
-        mapId="DEMO_MAP_ID"
         defaultCenter={resolvedPos}
         defaultZoom={19}
         mapTypeId="hybrid"
@@ -257,15 +285,40 @@ const SatelliteViewPanel: React.FC<{
         internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
         style={{ width: '100%', height: '100%' }}
       >
-        <AdvancedMarker position={resolvedPos}>
-          <Pin background="#0F766E" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
-        </AdvancedMarker>
+        <SafeMapMarker position={resolvedPos} color="#0F766E" />
       </GoogleMap>
       <div className="pointer-events-none absolute left-3 bottom-3 z-10 rounded-lg bg-slate-950/75 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-md">
         Zoom 19x Parcel Lock · {address}
       </div>
     </div>
   );
+};
+
+const SatelliteViewPanel: React.FC<{
+  lat: number;
+  lng: number;
+  address: string;
+}> = ({ lat, lng, address }) => {
+  if (!HAS_GOOGLE_MAPS_KEY) {
+    return (
+      <div className="flex h-[340px] sm:h-[400px] flex-col items-center justify-center rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-900 p-6 text-center text-white">
+        <Compass className="h-7 w-7 text-[#5EEAD4]" />
+        <p className="mt-3 text-sm font-semibold">Satellite Parcel Coordinates Locked</p>
+        <p className="mt-1 text-xs text-slate-300">{address} ({lat.toFixed(5)}, {lng.toFixed(5)})</p>
+        <a
+          href={`https://www.google.com/maps/@${lat},${lng},19z/data=!3m1!1e3`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#0F766E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#0D625B]"
+        >
+          Open Satellite in Google Maps
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+    );
+  }
+
+  return <LiveSatelliteMap lat={lat} lng={lng} address={address} />;
 };
 
 export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
@@ -360,6 +413,9 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
   });
   const [aiBrief, setAiBrief] = useState<string>('');
   const [isLoadingBrief, setIsLoadingBrief] = useState(false);
+  const [selectedCompIndices, setSelectedCompIndices] = useState<number[]>(() =>
+    property.comps.map((_, idx) => idx)
+  );
 
   // Engagement, Email Dispatch & Scripts state
   const [isSkipTracing, setIsSkipTracing] = useState(false);
@@ -462,6 +518,34 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
     }
   };
 
+  const selectedComps = useMemo(
+    () => property.comps.filter((_, idx) => selectedCompIndices.includes(idx)),
+    [property.comps, selectedCompIndices]
+  );
+
+  const selectedCompsAvgPpsf = useMemo(() => {
+    if (selectedComps.length === 0) return Math.round(property.avmValue / Math.max(1, property.sqft));
+    const total = selectedComps.reduce((sum, c) => sum + c.pricePerSqft, 0);
+    return Math.round(total / selectedComps.length);
+  }, [selectedComps, property.avmValue, property.sqft]);
+
+  const selectedCompsArv = useMemo(
+    () => Math.max(10000, Math.round(selectedCompsAvgPpsf * Math.max(400, property.sqft))),
+    [selectedCompsAvgPpsf, property.sqft]
+  );
+
+  const handleApplyRehabPreset = (costPerSqft: number) => {
+    const totalBudget = Math.max(5000, Math.round(Math.max(800, property.sqft) * costPerSqft));
+    setRehabItems({
+      roofAndExterior: Math.round(totalBudget * 0.18),
+      kitchenAndBaths: Math.round(totalBudget * 0.34),
+      flooringAndPaint: Math.round(totalBudget * 0.18),
+      hvacPlumbingElectrical: Math.round(totalBudget * 0.16),
+      foundationAndPermits: Math.round(totalBudget * 0.06),
+      contingency: Math.round(totalBudget * 0.08),
+    });
+  };
+
   const handleExportProformaReport = () => {
     const report = `PROB8 INVESTOR UNDERWRITING PROFORMA\nGenerated for: ${userEmail}\nProperty: ${property.address}, ${property.city}, ${property.state} ${property.zip}\nAsset Class: ${assetClass} | Strategy: ${strategy.toUpperCase()}\n\nVALUATION & OFFER\n- Estimated ARV: ${formatCurrency(arv)}\n- Probate Asking Price: ${formatCurrency(property.probatePrice)}\n- 70% Rule MAO: ${formatCurrency(underwriting.mao70Rule)}\n- Wholesale Target Offer: ${formatCurrency(underwriting.wholesaleMao)}\n- Total Rehab Budget: ${formatCurrency(underwriting.totalRehab)}\n\nCASH FLOW & RETURNS\n- Gross Monthly Income: ${formatCurrency(underwriting.grossMonthlyIncome)}\n- Monthly Debt + OpEx: ${formatCurrency(underwriting.totalMonthlyDebtAndExpenses)}\n- Net Monthly Cash Flow: ${formatCurrency(underwriting.monthlyCashFlow)}\n- Annual NOI: ${formatCurrency(underwriting.annualNOI)}\n- DSCR: ${underwriting.dscr} | Cap Rate: ${underwriting.capRatePct}% | Cash-on-Cash ROI: ${underwriting.cashOnCashRoiPct}%\n- Fix & Flip Net Profit: ${formatCurrency(underwriting.flipNetProfit)} (${underwriting.flipRoiPct}% ROI)\n- BRRRR Refi Proceeds: ${formatCurrency(underwriting.brrrrRefiProceeds)} | Cash Left In Deal: ${formatCurrency(underwriting.brrrrCashLeftInDeal)}\n- 5-Year Projected Combined Return: ${formatCurrency(underwriting.fiveYearEquityAndCashflow)}\n`;
     const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
@@ -469,6 +553,23 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
     const a = document.createElement('a');
     a.href = url;
     a.download = `Prob8_Proforma_${property.address.replace(/\s+/g, '_')}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadInvestorDealPacket = () => {
+    const compRows = selectedComps
+      .map(
+        (c) =>
+          `<tr><td>${c.address}</td><td>${c.sqft.toLocaleString()}</td><td>${formatCurrency(c.soldPrice)}</td><td>$${c.pricePerSqft}/sf</td></tr>`
+      )
+      .join('');
+    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Prob8 Investor Deal Packet - ${property.address}</title><style>body{font-family:system-ui,-apple-system,sans-serif;max-width:860px;margin:32px auto;padding:0 20px;color:#0f172a;line-height:1.5}header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:2px solid #0f766e;padding-bottom:12px;margin-bottom:20px}h1{margin:0;font-size:22px}.badge{background:#0f766e;color:#fff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0}.card{border:1px solid #cbd5e1;border-radius:10px;padding:12px}.label{font-size:11px;color:#64748b;text-transform:uppercase}.val{font-size:18px;font-weight:700;font-family:monospace;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}th,td{border-bottom:1px solid #e2e8f0;padding:8px;text-align:left}footer{margin-top:28px;font-size:11px;color:#64748b;border-top:1px solid #e2e8f0;padding-top:10px}</style></head><body><header><div><div style="font-size:12px;color:#0f766e;font-weight:700">PROB8 INSTITUTIONAL INVESTOR PACKET</div><h1>${property.address}, ${property.city}, ${property.state} ${property.zip}</h1><div style="font-size:13px;color:#475569">APN ${property.apn} · Case ${property.probateCaseNumber} · ${property.county}, ${property.state}</div></div><span class="badge">${strategy.toUpperCase()} · ${assetClass}</span></header><div class="grid"><div class="card"><div class="label">Target ARV</div><div class="val">${formatCurrency(arv)}</div></div><div class="card"><div class="label">70% Rule MAO</div><div class="val">${formatCurrency(underwriting.mao70Rule)}</div></div><div class="card"><div class="label">Rehab Scope</div><div class="val">${formatCurrency(underwriting.totalRehab)}</div></div><div class="card"><div class="label">Est. Flip Net Profit</div><div class="val">${formatCurrency(underwriting.flipNetProfit)} (${underwriting.flipRoiPct}%)</div></div><div class="card"><div class="label">Monthly Cash Flow</div><div class="val">${formatCurrency(underwriting.monthlyCashFlow)}/mo</div></div><div class="card"><div class="label">DSCR / Cap Rate</div><div class="val">${underwriting.dscr}x · ${underwriting.capRatePct}%</div></div></div><h2 style="font-size:15px;margin-top:20px">Probate &amp; Parcel Summary</h2><p style="font-size:13px">${property.beds}bd / ${property.baths}ba · ${property.sqft.toLocaleString()} sqft · Built ${property.yearBuilt} · Executor: ${property.executorName} · Court: ${property.courtName}</p><h2 style="font-size:15px;margin-top:20px">Weighted Sold Comparables (${selectedComps.length} selected · Avg $${selectedCompsAvgPpsf}/sqft)</h2><table><thead><tr><th>Address</th><th>SqFt</th><th>Sold Price</th><th>$/SqFt</th></tr></thead><tbody>${compRows}</tbody></table><footer>Prepared via Prob8 Deal Underwriting Platform for ${userEmail}. Print or Save as PDF via your browser menu.</footer></body></html>`;
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Prob8_Deal_Packet_${property.address.replace(/\s+/g, '_')}.html`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1366,13 +1467,34 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
                     </dl>
                   </div>
 
-                  <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6">
-                    <h3 className="font-display text-base font-bold text-slate-900 dark:text-white mb-3">
-                      Nearby Sold Comparables
-                    </h3>
+                  <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
+                          Interactive Sold Comparables ({selectedComps.length}/{property.comps.length} Selected)
+                        </h3>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          Selected Avg: <span className="font-mono font-semibold">${selectedCompsAvgPpsf}/sqft</span> · Recomputed ARV:{' '}
+                          <span className="font-mono font-bold text-[#0F766E] dark:text-emerald-400">
+                            {formatCurrency(selectedCompsArv)}
+                          </span>
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setArv(selectedCompsArv);
+                          setActiveTab('underwriter');
+                        }}
+                        className="inline-flex h-8 items-center gap-1 rounded-lg bg-[#0F766E] px-3 text-xs font-semibold text-white hover:bg-[#0D625B]"
+                      >
+                        Apply Comps ARV ({formatCurrency(selectedCompsArv)})
+                      </button>
+                    </div>
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="text-left text-slate-500 dark:text-slate-400 border-b border-slate-100 dark:border-slate-800">
+                          <th className="py-2 w-8">Use</th>
                           <th className="py-2">Address</th>
                           <th className="py-2 text-right">SqFt</th>
                           <th className="py-2 text-right">Price</th>
@@ -1380,16 +1502,32 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                        {property.comps.map((comp, idx) => (
-                          <tr key={idx}>
-                            <td className="py-2 font-medium">{comp.address}</td>
-                            <td className="py-2 text-right font-mono tabular-nums">{comp.sqft.toLocaleString()}</td>
-                            <td className="py-2 text-right font-mono font-semibold tabular-nums">
-                              {formatCurrency(comp.soldPrice)}
-                            </td>
-                            <td className="py-2 text-right font-mono tabular-nums">${comp.pricePerSqft}</td>
-                          </tr>
-                        ))}
+                        {property.comps.map((comp, idx) => {
+                          const checked = selectedCompIndices.includes(idx);
+                          return (
+                            <tr key={idx} className={!checked ? 'opacity-50' : ''}>
+                              <td className="py-2">
+                                <input
+                                  type="checkbox"
+                                  aria-label={`Include comparable ${comp.address}`}
+                                  checked={checked}
+                                  onChange={() =>
+                                    setSelectedCompIndices((prev) =>
+                                      prev.includes(idx) ? prev.filter((i) => i !== idx) : [...prev, idx]
+                                    )
+                                  }
+                                  className="h-3.5 w-3.5 accent-[#0F766E]"
+                                />
+                              </td>
+                              <td className="py-2 font-medium">{comp.address}</td>
+                              <td className="py-2 text-right font-mono tabular-nums">{comp.sqft.toLocaleString()}</td>
+                              <td className="py-2 text-right font-mono font-semibold tabular-nums">
+                                {formatCurrency(comp.soldPrice)}
+                              </td>
+                              <td className="py-2 text-right font-mono tabular-nums">${comp.pricePerSqft}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1617,10 +1755,28 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
                     </div>
                   </div>
 
-                  <div className="border-t border-slate-100 dark:border-slate-800 pt-4">
-                    <h4 className="text-xs font-semibold text-slate-700 dark:text-slate-300 mb-3">
-                      Itemized Rehab Line Items
-                    </h4>
+                  <div className="border-t border-slate-100 dark:border-slate-800 pt-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h4 className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                        Itemized Rehab Line Items
+                      </h4>
+                      <div className="flex flex-wrap gap-1.5">
+                        {[
+                          { label: 'Cosmetic ($20/sf)', rate: 20 },
+                          { label: 'Standard ($35/sf)', rate: 35 },
+                          { label: 'Full Gut ($60/sf)', rate: 60 },
+                        ].map((preset) => (
+                          <button
+                            key={preset.label}
+                            type="button"
+                            onClick={() => handleApplyRehabPreset(preset.rate)}
+                            className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-[#090D16] px-2.5 py-1 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:border-[#0F766E] hover:text-[#0F766E] dark:hover:text-emerald-400"
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                       {(
                         [
@@ -1653,18 +1809,28 @@ export const PropertyDossierModal: React.FC<PropertyDossierModalProps> = ({
 
                 {/* Right Prob8 Underwriter Output Card */}
                 <div className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-6 space-y-4">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
                       Proforma Output ({strategy.toUpperCase()})
                     </h3>
-                    <button
-                      type="button"
-                      onClick={handleExportProformaReport}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      Export Report
-                    </button>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleExportProformaReport}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        TXT
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDownloadInvestorDealPacket}
+                        className="inline-flex items-center gap-1 rounded-lg bg-slate-900 dark:bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-slate-800"
+                      >
+                        <FileText className="h-3.5 w-3.5" />
+                        Deal Packet
+                      </button>
+                    </div>
                   </div>
 
                   <div className="rounded-xl bg-slate-900 dark:bg-[#090D16] border border-slate-800 p-5 text-white">

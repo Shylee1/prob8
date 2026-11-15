@@ -1,7 +1,170 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
-  <rect width="512" height="512" rx="112" fill="#090D16"/>
-  <rect x="20" y="20" width="472" height="472" rx="96" stroke="#10B981" stroke-opacity="0.35" stroke-width="10"/>
-  <path d="M132 246L256 138L380 246V374C380 383.941 371.941 392 362 392H150C140.059 392 132 383.941 132 374V246Z" stroke="#F8FAFC" stroke-width="24" stroke-linejoin="round"/>
-  <path d="M256 196C235.013 196 218 213.013 218 234C218 254.987 235.013 272 256 272C276.987 272 294 254.987 294 234C294 213.013 276.987 196 256 196Z" stroke="#10B981" stroke-width="20"/>
-  <path d="M256 272C230.595 272 210 292.595 210 318C210 343.405 230.595 364 256 364C281.405 364 302 343.405 302 318C302 292.595 281.405 272 256 272Z" stroke="#6366F1" stroke-width="20"/>
+  <defs>
+    <!-- Deep midnight navy rounded icon background -->
+    <radialGradient id="bg-grad" cx="50%" cy="44%" r="68%">
+      <stop offset="0%" stop-color="#0E1B2E"/>
+      <stop offset="65%" stop-color="#08101C"/>
+      <stop offset="100%" stop-color="#050911"/>
+    </radialGradient>
+
+    <!-- Brushed anodized mint-emerald gradient matching prob8logo -->
+    <linearGradient id="mint-metal" x1="110" y1="110" x2="402" y2="402" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#35A98A"/>
+      <stop offset="24%" stop-color="#8DF4D6"/>
+      <stop offset="46%" stop-color="#4ECBA8"/>
+      <stop offset="64%" stop-color="#A7FCE2"/>
+      <stop offset="84%" stop-color="#3EB696"/>
+      <stop offset="100%" stop-color="#76E7C6"/>
+    </linearGradient>
+
+    <!-- Radial metallic bevel sheen across the figure-8 -->
+    <radialGradient id="center-sheen" cx="50%" cy="52%" r="36%">
+      <stop offset="0%" stop-color="#C8FFF0" stop-opacity="0.32"/>
+      <stop offset="55%" stop-color="#48C6A5" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#195E4B" stop-opacity="0.20"/>
+    </radialGradient>
+
+    <!-- Subtle horizontal brushed-metal texture -->
+    <filter id="brushed" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.28" numOctaves="2" seed="7" result="noise"/>
+      <feColorMatrix type="matrix" in="noise" values="
+        0 0 0 0 0.72
+        0 0 0 0 0.98
+        0 0 0 0 0.90
+        0 0 0 0.14 0" result="tint"/>
+      <feComposite in="tint" in2="SourceGraphic" operator="atop" result="textured"/>
+      <feBlend in="SourceGraphic" in2="textured" mode="screen"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Rounded Icon Badge -->
+  <rect width="512" height="512" rx="116" fill="url(#bg-grad)"/>
+
+  <!-- Scale emblem cleanly to match prob8logo proportions inside the squircle -->
+  <g transform="translate(256, 256) scale(1.13) translate(-256, -256)">
+    <g filter="url(#brushed)">
+      <!-- Roof with overhanging horizontal eaves & right chimney -->
+      <path fill="url(#mint-metal)" d="
+        M 256 114
+        L 312 158
+        L 312 132
+        L 335 132
+        L 335 175
+        L 388 216
+        L 353 216
+        L 256 140
+        L 159 216
+        L 124 216
+        Z
+      "/>
+
+      <!-- Upper Left Side Wall hugging upper loop of 8 (stops at waist gap y=264) -->
+      <path fill="url(#mint-metal)" d="
+        M 164 213
+        L 192 191
+        L 192 218
+        C 188 235 191 251 198 264
+        L 167 264
+        C 164 247 164 230 164 213
+        Z
+      "/>
+
+      <!-- Upper Right Side Wall hugging upper loop of 8 (stops at waist gap y=264) -->
+      <path fill="url(#mint-metal)" d="
+        M 348 213
+        L 320 191
+        L 320 218
+        C 324 235 321 251 314 264
+        L 345 264
+        C 348 247 348 230 348 213
+        Z
+      "/>
+
+      <!-- Lower Left Curved Bracket hugging lower loop of 8 (starts below waist gap y=276) -->
+      <path fill="url(#mint-metal)" d="
+        M 166 276
+        L 195 276
+        C 182 297 180 327 197 357
+        C 172 339 160 309 166 276
+        Z
+      "/>
+
+      <!-- Lower Right Curved Bracket hugging lower loop of 8 (starts below waist gap y=276) -->
+      <path fill="url(#mint-metal)" d="
+        M 346 276
+        L 317 276
+        C 330 297 332 327 315 357
+        C 340 339 352 309 346 276
+        Z
+      "/>
+
+      <!-- Sculpted Infinity Figure-8 Ribbon -->
+      <path fill="url(#mint-metal)" fill-rule="evenodd" d="
+        M 256 172
+        C 290 172 311 195 311 225
+        C 311 245 300 260 285 269
+        C 306 280 320 302 320 330
+        C 320 369 292 396 256 396
+        C 220 396 192 369 192 330
+        C 192 302 206 280 227 269
+        C 212 260 201 245 201 225
+        C 201 195 222 172 256 172
+        Z
+
+        M 256 198
+        C 238 198 228 211 228 227
+        C 228 242 238 253 256 259
+        C 274 253 284 242 284 227
+        C 284 211 274 198 256 198
+        Z
+
+        M 256 293
+        C 235 301 223 316 223 335
+        C 223 355 237 369 256 369
+        C 275 369 289 355 289 335
+        C 289 316 277 301 256 293
+        Z
+      "/>
+
+      <!-- Specular shading overlay on the 8 -->
+      <path fill="url(#center-sheen)" fill-rule="evenodd" d="
+        M 256 172
+        C 290 172 311 195 311 225
+        C 311 245 300 260 285 269
+        C 306 280 320 302 320 330
+        C 320 369 292 396 256 396
+        C 220 396 192 369 192 330
+        C 192 302 206 280 227 269
+        C 212 260 201 245 201 225
+        C 201 195 222 172 256 172
+        Z
+
+        M 256 198
+        C 238 198 228 211 228 227
+        C 228 242 238 253 256 259
+        C 274 253 284 242 284 227
+        C 284 211 274 198 256 198
+        Z
+
+        M 256 293
+        C 235 301 223 316 223 335
+        C 223 355 237 369 256 369
+        C 275 369 289 355 289 335
+        C 289 316 277 301 256 293
+        Z
+      "/>
+    </g>
+
+    <!-- Crisp Dark Map Location Pin at Center Pinch of the 8 -->
+    <path fill="#060D18" d="
+      M 256 257
+      C 249 257 244 262.2 244 269
+      C 244 276.2 253 285 256 290
+      C 259 285 268 276.2 268 269
+      C 268 262.2 263 257 256 257
+      Z
+    "/>
+    <!-- Mint center dot inside Map Pin -->
+    <circle cx="256" cy="268.5" r="4.3" fill="#82F3D2"/>
+  </g>
 </svg>

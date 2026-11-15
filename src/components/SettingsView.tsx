@@ -46,6 +46,7 @@ interface SettingsViewProps {
   onUpdateProfile: (patch: Partial<UserProfile>) => void;
   onCheckoutPlan: (plan: 'pro' | 'vip_lifetime', isTrial?: boolean, promoCode?: string) => void;
   onOpenAffiliatePortal: () => void;
+  onOpenSupport?: () => void;
   onSignOut: () => void;
 }
 
@@ -72,6 +73,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateProfile,
   onCheckoutPlan,
   onOpenAffiliatePortal,
+  onOpenSupport,
   onSignOut,
 }) => {
   const safeAiConfig = profile?.aiConfig ?? {
@@ -1025,6 +1027,16 @@ Quick Install Options:
                 )}
               </div>
             </div>
+          )}
+
+          {onOpenSupport && (
+            <button
+              type="button"
+              onClick={onOpenSupport}
+              className="w-full h-9 rounded-xl border border-slate-200 dark:border-slate-700 px-3 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              Billing Question, Suggestion, or Refund Request &rarr;
+            </button>
           )}
         </section>
 

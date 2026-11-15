@@ -165,6 +165,102 @@ export interface LedgerTransaction {
   netUsd: number;
   status: 'paid' | 'refunded' | 'trial';
   affiliateCode?: string;
+  externalOrderId?: string;
+  refundedAmountUsd?: number;
+  refundedAt?: string;
+  refundReason?: string;
+}
+
+export type SupportTicketCategory =
+  | 'feature_suggestion'
+  | 'refund_request'
+  | 'billing_support'
+  | 'bug_report'
+  | 'general';
+
+export type SupportTicketStatus = 'open' | 'in_review' | 'resolved' | 'refunded';
+
+export interface SupportTicket {
+  id: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  subscriptionTier: SubscriptionTier;
+  category: SupportTicketCategory;
+  subject: string;
+  message: string;
+  relatedTransactionId?: string;
+  relatedOrderId?: string;
+  requestedRefundUsd?: number;
+  status: SupportTicketStatus;
+  adminResponse?: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+export interface LemonSqueezyStoreSummary {
+  id: string;
+  name: string;
+  slug: string;
+  domain: string;
+  url: string;
+  currency: string;
+  plan: string;
+  countryNicename: string;
+}
+
+export interface LemonSqueezyOrderSummary {
+  id: string;
+  orderNumber: number;
+  userName: string;
+  userEmail: string;
+  productName: string;
+  variantName: string;
+  totalUsd: number;
+  totalFormatted: string;
+  refunded: boolean;
+  refundedAmountUsd: number;
+  refundedAt?: string;
+  status: string;
+  statusFormatted: string;
+  testMode: boolean;
+  receiptUrl?: string;
+  createdAt: string;
+}
+
+export interface LemonSqueezySubscriptionSummary {
+  id: string;
+  storeId: string;
+  orderId: string;
+  userName: string;
+  userEmail: string;
+  productName: string;
+  variantName: string;
+  status: string;
+  statusFormatted: string;
+  renewsAt?: string;
+  endsAt?: string;
+  trialEndsAt?: string;
+  testMode: boolean;
+  cancelled: boolean;
+  updatePaymentMethodUrl?: string;
+  customerPortalUrl?: string;
+  createdAt: string;
+}
+
+export interface LemonSqueezyOverviewResponse {
+  configured: boolean;
+  mode: 'test' | 'live' | 'unconfigured';
+  account?: {
+    id: string;
+    name: string;
+    email?: string;
+  };
+  stores: LemonSqueezyStoreSummary[];
+  orders: LemonSqueezyOrderSummary[];
+  subscriptions: LemonSqueezySubscriptionSummary[];
+  error?: string;
 }
 
 export interface CustomIntegration {

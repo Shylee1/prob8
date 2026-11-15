@@ -19,6 +19,7 @@ import type {
   PropertyRecord,
   RegisteredUserRecord,
   SubscriptionTier,
+  SupportTicket,
   UserProfile,
 } from '../types';
 
@@ -31,6 +32,7 @@ const AFFILIATES_KEY = 'prob8_affiliates_v3';
 const CUSTOM_INTEGRATIONS_KEY = 'prob8_custom_integrations_v2';
 const PAYMENT_SETTINGS_KEY = 'prob8_payment_settings_v2';
 const LEDGER_TRANSACTIONS_KEY = 'prob8_ledger_transactions_v2';
+const SUPPORT_TICKETS_KEY = 'prob8_support_tickets_v1';
 
 export interface WorkspaceSnapshot {
   profile: UserProfile;
@@ -362,6 +364,25 @@ export function loadLedgerTransactions(): LedgerTransaction[] {
 export function saveLedgerTransactions(txns: LedgerTransaction[]): void {
   if (typeof window === 'undefined') return;
   window.localStorage.setItem(LEDGER_TRANSACTIONS_KEY, JSON.stringify(txns));
+}
+
+export function loadSupportTickets(): SupportTicket[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(SUPPORT_TICKETS_KEY);
+    return raw ? (JSON.parse(raw) as SupportTicket[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveSupportTickets(tickets: SupportTicket[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SUPPORT_TICKETS_KEY, JSON.stringify(tickets));
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export function loadAdminIntegrations(): AdminIntegration[] {

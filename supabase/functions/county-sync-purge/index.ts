@@ -27,7 +27,14 @@ Deno.serve(async (req) => {
       .eq('zillow_data->>status', 'Sold')
       .select('id');
 
-    // 2. Refresh timestamp on active records and log the twice-daily sync run
+    // 2. Update existing active parcels (refresh last_synced_at & active status telemetry)
+    const nowIso = new Date().toISOString();
+    const { data: updatedRows } = await supabase
+      .from('properties')
+      .update({ last_synced_at: nowIso })
+      .neq('status', 'purged_sold')
+      .select('id');
+
     const { count: activeCount } = await supabase
       .from('properties')
       .select('id', { count: 'exact', head: true })
@@ -37,6 +44,7 @@ Deno.serve(async (req) => {
       run_slot: slot,
       counties_scanned: 3143,
       new_filings_ingested: 42,
+      existing_properties_updated: updatedRows?.length ?? 0,
       sold_properties_purged: purgedRows?.length ?? 0,
       auctions_updated: 18,
     };

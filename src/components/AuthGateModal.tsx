@@ -175,10 +175,12 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
       </div>
 
       <div className="mx-auto w-full max-w-md space-y-6">
-        <div className="text-center space-y-2">
-          <div className="mx-auto inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[#0F766E] font-mono text-lg font-bold text-white shadow-lg shadow-[#0F766E]/25">
-            P8
-          </div>
+        <div className="text-center space-y-2.5">
+          <img
+            src="/icon.svg?v=3"
+            alt="Prob8 Logo"
+            className="mx-auto h-20 w-20 rounded-[22px] shadow-xl shadow-slate-950/25 ring-1 ring-white/10"
+          />
           <h1 className="font-display text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">
             Welcome to Prob8
           </h1>
